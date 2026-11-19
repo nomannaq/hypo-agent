@@ -12,14 +12,18 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	inertia "github.com/romsar/gonertia/v2"
+
+	"nomanqureshi.dev/hpyo-agent/internal/model"
 )
 
 type server struct {
-	db  *pgxpool.Pool
-	app *inertia.ViteInstance
+	db    *pgxpool.Pool
+	app   *inertia.ViteInstance
+	model *model.Client
 }
 
 func main() {
+	loadDotEnv(".env")
 	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
@@ -51,7 +55,11 @@ func main() {
 	if err := app.ShareTemplateFunc("reactRefresh", reactRefresh); err != nil {
 		log.Fatal(err)
 	}
-	s := &server{db: db, app: app}
+	s := &server{
+		db:    db,
+		app:   app,
+		model: model.NewClient(os.Getenv("NEBIUS_TOKEN_FACTORY"), os.Getenv("NEBIUS_BASE_URL"), os.Getenv("NEBIUS_MODEL")),
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /build/", http.StripPrefix("/build/", http.FileServer(http.Dir("public/build"))))
@@ -64,6 +72,7 @@ func main() {
 	mux.HandleFunc("POST /logout", s.logout)
 
 	mux.HandleFunc("GET /agent", s.authOnly(s.page("agent")))
+	mux.HandleFunc("POST /api/chat", s.authOnly(s.chat))
 	mux.Handle("GET /settings", http.RedirectHandler("/settings/profile", http.StatusFound))
 	mux.HandleFunc("GET /settings/profile", s.authOnly(s.page("settings/profile")))
 	mux.HandleFunc("PATCH /settings/profile", s.authOnly(s.updateProfile))

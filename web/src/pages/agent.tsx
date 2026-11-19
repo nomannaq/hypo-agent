@@ -25,18 +25,18 @@ type Turn = {
     pending?: boolean;
 };
 
-// TODO: start a durable agent run (Temporal) and stream its events over SSE.
-// Until the runtime is wired, the reply says so instead of faking an answer.
-const runAgent = () =>
-    new Promise<string>((resolve) =>
-        setTimeout(
-            () =>
-                resolve(
-                    "The agent runtime isn't connected yet. Once it is, this reply will stream from a durable run.",
-                ),
-            1200,
-        ),
-    );
+// TODO: replace with a durable agent run streamed over SSE.
+const chat = async (
+    messages: { role: 'user' | 'assistant'; content: string }[],
+) => {
+    const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages }),
+    });
+    if (!res.ok) throw new Error('request failed');
+    return ((await res.json()) as { reply: string }).reply;
+};
 
 export default function Agent() {
     const [turns, setTurns] = useState<Turn[]>([]);
@@ -61,11 +61,29 @@ export default function Agent() {
         ]);
         setLoading(true);
         try {
-            const reply = await runAgent();
+            const history = [
+                ...turns
+                    .filter((t) => !t.pending && t.text)
+                    .map((t) => ({ role: t.from, content: t.text })),
+                { role: 'user' as const, content: text },
+            ];
+            const reply = await chat(history);
             setTurns((t) =>
                 t.map((turn) =>
                     turn.id === replyId
                         ? { ...turn, text: reply, pending: false }
+                        : turn,
+                ),
+            );
+        } catch {
+            setTurns((t) =>
+                t.map((turn) =>
+                    turn.id === replyId
+                        ? {
+                              ...turn,
+                              text: 'Sorry, something went wrong reaching the model. Please try again.',
+                              pending: false,
+                          }
                         : turn,
                 ),
             );

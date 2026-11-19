@@ -81,7 +81,7 @@ graph LR
 
 # Delivery Steps
 
-###   Step 1: Agent core: reducer, memkernel, model client, executor loop
+### * Step 1: Agent core: reducer, memkernel, model client, executor loop
 A run can execute a model -> tool -> result loop in-process, journaled via memkernel, with golden tests.
 
 - Define State/Event/Reduce in `internal/agent` with golden tests.
