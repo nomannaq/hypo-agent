@@ -144,7 +144,7 @@ func (s *server) authOnly(h http.HandlerFunc) http.HandlerFunc {
 func (s *server) guestOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if currentUser(r) != nil {
-			s.app.Redirect(w, r, "/dashboard")
+			s.app.Redirect(w, r, "/agent")
 			return
 		}
 		h(w, r)
@@ -175,7 +175,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.app.Redirect(w, r, "/dashboard")
+	s.app.Redirect(w, r, "/agent")
 }
 
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +214,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.app.Redirect(w, r, "/dashboard")
+	s.app.Redirect(w, r, "/agent")
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {

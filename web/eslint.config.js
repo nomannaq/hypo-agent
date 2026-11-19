@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // Vendored from beui.dev (linted upstream with Biome, not ESLint).
+  globalIgnores(['dist', 'src/components/agents', 'src/components/motion']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

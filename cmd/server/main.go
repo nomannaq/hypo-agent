@@ -63,7 +63,7 @@ func main() {
 	mux.HandleFunc("POST /register", s.guestOnly(s.register))
 	mux.HandleFunc("POST /logout", s.logout)
 
-	mux.HandleFunc("GET /dashboard", s.authOnly(s.page("dashboard")))
+	mux.HandleFunc("GET /agent", s.authOnly(s.page("agent")))
 	mux.Handle("GET /settings", http.RedirectHandler("/settings/profile", http.StatusFound))
 	mux.HandleFunc("GET /settings/profile", s.authOnly(s.page("settings/profile")))
 	mux.HandleFunc("PATCH /settings/profile", s.authOnly(s.updateProfile))

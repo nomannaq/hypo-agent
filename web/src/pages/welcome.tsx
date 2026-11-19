@@ -1,5 +1,5 @@
 import { Head, Link, usePage } from '@inertiajs/react';
-import { dashboard, login } from '@/routes';
+import { agent, login } from '@/routes';
 import { register } from '@/routes';
 import AppLogoIcon from '@/components/app-logo-icon';
 
@@ -14,10 +14,10 @@ export default function Welcome() {
                     <nav className="flex items-center justify-end gap-4">
                         {auth.user ? (
                             <Link
-                                href={dashboard()}
+                                href={agent()}
                                 className="inline-block rounded-sm border border-[#19140035] px-5 py-1.5 text-sm leading-normal text-[#1b1b18] hover:border-[#1915014a] dark:border-[#3E3E3A] dark:text-[#EDEDEC] dark:hover:border-[#62605b]"
                             >
-                                Dashboard
+                                Open agent
                             </Link>
                         ) : (
                             <>
@@ -46,7 +46,7 @@ export default function Welcome() {
                             validation.
                         </p>
                         <Link
-                            href={auth.user ? dashboard() : register()}
+                            href={auth.user ? agent() : register()}
                             className="inline-block rounded-sm border border-black bg-[#1b1b18] px-5 py-1.5 text-sm leading-normal text-white hover:border-black hover:bg-black dark:border-[#eeeeec] dark:bg-[#eeeeec] dark:text-[#1C1C1A] dark:hover:border-white dark:hover:bg-white"
                         >
                             Get started
