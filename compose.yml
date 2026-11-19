@@ -9,5 +9,27 @@ services:
       test: ["CMD-SHELL", "pg_isready -U hypo -d hypo"]
       interval: 2s
       retries: 30
+
+  # Temporal gets its own databases (temporal, temporal_visibility) on this
+  # same Postgres instance — no second database engine to run.
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: db
+    ports: ["7233:7233"]
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["8088:8080"] # 8080 is cmd/server
 volumes:
   pgdata:
