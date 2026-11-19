@@ -1,0 +1,14 @@
+# Go hot reload: `make dev` runs this. Rebuilds the server when Go code or web/app.html changes.
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/server ./cmd/server"
+  entrypoint = ["./tmp/server"]
+  include_ext = ["go", "html"]
+  exclude_dir = ["tmp", "public", "web/node_modules", "web/src", "db/migrations", ".idea"]
+  exclude_regex = ["_test\\.go$"]
+  delay = 200
+
+[log]
+  main_only = true
