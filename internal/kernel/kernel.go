@@ -7,8 +7,18 @@ package kernel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/rand"
 	"time"
+)
+
+var (
+	// ErrTimeout is returned by Await when no signal arrives in time.
+	ErrTimeout = errors.New("kernel: await timed out")
+	// ErrNondeterminism means replay reached a journal entry recorded by a
+	// different call (another step name, or a Sleep where a Step was). The
+	// workflow code changed under a live run; continuing would corrupt it.
+	ErrNondeterminism = errors.New("kernel: nondeterministic replay")
 )
 
 // Ctx is the only contract between the runtime and the durability engine.

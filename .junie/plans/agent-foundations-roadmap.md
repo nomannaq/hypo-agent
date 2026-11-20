@@ -81,13 +81,15 @@ graph LR
 
 # Delivery Steps
 
-### * Step 1: Agent core: reducer, memkernel, model client, executor loop
+### ✓ Step 1: Agent core: reducer, memkernel, model client, executor loop
 A run can execute a model -> tool -> result loop in-process, journaled via memkernel, with golden tests.
 
 - Define State/Event/Reduce in `internal/agent` with golden tests.
 - Implement `internal/kernel/memkernel` and run `conformance` against it.
 - Implement `internal/model` Nebius client with retry and usage metering.
 - Implement `internal/executor.Run` using `kernel.StepT` for every model and tool call.
+
+Done: `make test` (reducer goldens, memkernel conformance, executor crash-resume + guards), `make smoke` (live Nebius chat + tool call). `/api/chat` runs through the executor on a per-request memkernel.
 
 ###   Step 2: Tool registry and first tools
 The executor resolves tool calls from a registry with effect types, idempotency keys and approvals.

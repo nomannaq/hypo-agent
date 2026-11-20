@@ -5,12 +5,12 @@ import {
     Message,
     MessageContent,
     MessageGroup,
-    MessageTyping,
 } from '@/components/agents/message';
 import {
     MessageBubble,
     MessageBubbleContent,
 } from '@/components/agents/message-bubble';
+import { AgentActivity } from '@/components/agents/agent-activity';
 import { GlowFrame } from '@/components/agents/glow-frame';
 import { MessageScroller } from '@/components/agents/message-scroller';
 import { PromptInput } from '@/components/agents/prompt-input';
@@ -23,6 +23,7 @@ type Turn = {
     from: 'user' | 'assistant';
     text: string;
     pending?: boolean;
+    seconds?: number; // how long the run took
 };
 
 // TODO: replace with a durable agent run streamed over SSE.
@@ -60,6 +61,8 @@ export default function Agent() {
             { id: replyId, from: 'assistant', text: '', pending: true },
         ]);
         setLoading(true);
+        const started = performance.now();
+        const seconds = () => Math.round((performance.now() - started) / 1000);
         try {
             const history = [
                 ...turns
@@ -71,7 +74,12 @@ export default function Agent() {
             setTurns((t) =>
                 t.map((turn) =>
                     turn.id === replyId
-                        ? { ...turn, text: reply, pending: false }
+                        ? {
+                              ...turn,
+                              text: reply,
+                              pending: false,
+                              seconds: seconds(),
+                          }
                         : turn,
                 ),
             );
@@ -83,6 +91,7 @@ export default function Agent() {
                               ...turn,
                               text: 'Sorry, something went wrong reaching the model. Please try again.',
                               pending: false,
+                              seconds: seconds(),
                           }
                         : turn,
                 ),
@@ -97,7 +106,7 @@ export default function Agent() {
     return (
         <>
             <Head title="Agent" />
-            <div className="flex h-[calc(100svh-5rem)] w-full flex-col px-4 pb-4">
+            <div className="flex h-full w-full flex-col px-4 pb-4">
                 {started ? (
                     <>
                         <div className="mx-auto flex w-full max-w-3xl items-center gap-3 py-3">
@@ -136,12 +145,27 @@ export default function Agent() {
                                                 </MessageBubbleContent>
                                             </MessageBubble>
                                         ) : (
-                                            <MessageContent>
-                                                {turn.pending ? (
-                                                    <MessageTyping />
-                                                ) : (
-                                                    turn.text
-                                                )}
+                                            <MessageContent className="flex flex-col gap-2">
+                                                {/* One real step until runs stream their events (roadmap Step 3). */}
+                                                <AgentActivity
+                                                    items={[
+                                                        {
+                                                            id: 'model',
+                                                            type: 'step',
+                                                            label: 'Asking the model',
+                                                            status: turn.pending
+                                                                ? 'active'
+                                                                : 'complete',
+                                                        },
+                                                    ]}
+                                                    status={
+                                                        turn.pending
+                                                            ? 'working'
+                                                            : 'complete'
+                                                    }
+                                                    duration={turn.seconds ?? 0}
+                                                />
+                                                {!turn.pending && turn.text}
                                             </MessageContent>
                                         )}
                                     </Message>
