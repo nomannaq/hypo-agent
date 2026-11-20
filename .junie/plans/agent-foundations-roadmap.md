@@ -105,12 +105,14 @@ The web agent page shows real streamed agent output instead of the fake reply.
 - Add server endpoints to start a run and stream via SSE with Last-Event-ID resume.
 - Replace `runAgent()` in `web/src/pages/agent.tsx`; render tool activity with `components/agents`.
 
-###   Step 4: Durable execution on Temporal
+### * Step 4: Durable execution on Temporal
 Runs survive worker crashes and pass the conformance and chaos tests.
 
-- Implement `temporalkernel` workflow, steps, continue-as-new and wire `cmd/worker-workflow` and `cmd/worker-activity`.
+- ✓ Implement `temporalkernel` and wire a worker (one `cmd/worker`; steps are named activities, not closures; continue-as-new deferred). See `durability.md`.
 - Implement scheduler budgets/caps and supervisor for stuck runs in `internal/runtime`.
-- Add kill-worker chaos test.
+- ✓ Add kill-worker chaos test.
+
+Done so far: `/api/chat` runs on Temporal via `cmd/worker`; conformance passes on both kernels; chaos test plus a manual `kill -9` mid-model-call (resumed on a new worker after the heartbeat timeout). Remaining: scheduler and supervisor.
 
 ###   Step 5: Persistent memory
 The agent recalls facts and summaries across sessions.
