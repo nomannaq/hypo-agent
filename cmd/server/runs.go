@@ -83,6 +83,44 @@ func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
 }
 
+// decideApproval answers the run's pending approval request: the run is
+// paused on an approval_requested event (its latest), waiting for the signal
+// named after that event's seq. Anything else is a stale or forged answer.
+func (s *server) decideApproval(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CallID   string `json:"call_id"`
+		Approved bool   `json:"approved"`
+	}
+	if !s.decode(w, r, &in) {
+		return
+	}
+	ctx := r.Context()
+	id := r.PathValue("id")
+	var seq int
+	var last agent.Event
+	err := s.db.QueryRow(ctx, `SELECT e.seq, e.event FROM run_events e JOIN agent_runs r ON r.id = e.run_id
+		WHERE e.run_id = $1 AND r.user_id = $2 ORDER BY e.seq DESC LIMIT 1`, id, currentUser(r).ID).Scan(&seq, &last)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if last.Kind != agent.ApprovalRequested || last.CallID != in.CallID {
+		http.Error(w, "nothing is waiting for that approval", http.StatusConflict)
+		return
+	}
+	payload, _ := json.Marshal(executor.Approval{Approved: in.Approved})
+	if err := s.temporal.SignalWorkflow(ctx, id, "", executor.ApprovalSignal(seq), payload); err != nil {
+		log.Printf("run %s: approval signal: %v", id, err)
+		http.Error(w, "the agent runtime is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // runEvents streams a run's events as server-sent events: `id` is the event's
 // seq and `data` the agent.Event. A reconnecting EventSource sends
 // Last-Event-ID and gets only what came after it. The stream folds events

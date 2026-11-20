@@ -39,15 +39,16 @@ Inertia (gonertia) + React 19 + Tailwind 4 frontend, Nebius Token Factory
 | `cmd/server`: auth, sessions, runs | **Done**: `POST /api/runs` starts a durable run; `GET /api/runs/{id}/events` streams its events (SSE) |
 | `cmd/worker` | **Done**: runs agent workflows and activities, persists run events; survives being killed mid-run |
 | Web UI: beUI chat shell, orb, messages, activity | **Done**: follows runs step by step, reattaches after a reload |
-| `internal/tool`, `internal/runtime`, `internal/memory` | Stubs (roadmap Steps 2–5) |
+| `internal/tool` | **Registry + read-only tools**: `web_search` (SearXNG), `browse` (Obscura headless browser); effects, ledger, sandbox are stubs (Step 2b) |
+| `internal/runtime`, `internal/memory` | Stubs (roadmap Steps 2b–5) |
 | `pgkernel` | Stub (learning path, time-boxed) |
 | Run scheduler, supervisor (rest of Step 4) | Stubs in `internal/runtime` |
-| `skills/`, `sandbox/images/` | Empty (Steps 2 and 6) |
+| `skills/`, `sandbox/images/` | Empty (Steps 2b and 6) |
 
-Roadmap Steps 1 (agent core) and 3 (streaming runs to the UI), and the
-durable-execution part of Step 4, are complete (see
-`.junie/plans/durability.md`). Next: Step 2 (tool registry, then approvals via
-`Await`).
+Roadmap Steps 1 (agent core) and 3 (streaming runs to the UI), Step 2a (tool
+registry, web search and browsing), and the durable-execution part of Step 4
+are complete (see `.junie/plans/durability.md`). Next: Step 2b (effects,
+idempotency ledger, approvals via `Await`).
 
 ## Architecture
 
@@ -61,8 +62,8 @@ web (React/Inertia) ──POST /api/runs──▶ cmd/server ──start workflo
                                                                        │
                                    internal/executor  ◀── the only package that
                                    │     │      │          wires everything
-                     internal/agent   model   tools
-                     (pure reducer)  (Nebius) (registry, Step 2)
+                     internal/agent   model   internal/tool ──▶ SearXNG (web_search)
+                     (pure reducer)  (Nebius)  (registry)    ──▶ Obscura (browse, CDP)
 ```
 
 Each run's events land in `run_events` (written by the worker's
@@ -116,9 +117,11 @@ internal/
   executor/        agent loop: reducer + kernel + model + tools, with guards
   model/           Nebius client: tool calling, retries, usage metering
   dotenv/          .env loader for binaries started without make
-  tool/ runtime/ memory/   stubs for roadmap Steps 2-5
+  tool/            tool registry + read-only tools (web_search, browse)
+  runtime/ memory/ stubs for roadmap Steps 2b-5
 db/migrations/     goose SQL migrations (users/sessions, pgkernel tables, agent_runs/run_events)
 web/               Vite + React frontend (see "Frontend" below)
+docker/            config for compose services (searxng/settings.yml)
 skills/ sandbox/   future skills and tool sandbox images
 .junie/plans/      the roadmap
 ```
@@ -284,6 +287,30 @@ Tool failures (unknown tool, malformed arguments, handler error, timeout) go
 back to the model as an error result so it can recover; they don't end the
 run.
 
+## Tools
+
+`internal/tool.Registry` is a slice of `tool.Tool` (name, description, JSON
+Schema, handler) and implements `executor.Tools`; `tool.Typed` builds a tool
+whose handler gets its arguments decoded. The worker builds the registry
+(`cmd/worker/main.go`). The executor reads `Specs()` in workflow code, so the
+registry must be the same on every worker and must not change under live runs.
+
+| Tool | Backend | Notes |
+|---|---|---|
+| `web_search` | SearXNG JSON API (`SEARXNG_URL`) | `{query, limit}`; limit defaults to 5, capped at 10 |
+| `browse` | Obscura over CDP (`OBSCURA_URL`, `OBSCURA_CDP_TOKEN`) | `{url}`, http(s) only; fresh browser context per call; returns title, final URL, Markdown |
+
+Both are read-only, so a retried call is just a repeat read. Obscura's SSRF
+guard refuses private and loopback addresses, which keeps pages away from the
+database and Temporal on the compose network. Tool output is untrusted (a
+page can contain instructions); the system prompt tells the model to treat it
+as data. Outputs over `MaxToolOutput` (16 KB) are truncated by the executor.
+
+To add a tool: write a `tool.Typed(...)` constructor in `internal/tool`, add a
+test (an `httptest` fake for HTTP backends, a gated `TestSmoke*` for the live
+service), and add it to the registry in `cmd/worker`. Tools with side effects
+wait for Step 2b (effects, idempotency ledger, approvals).
+
 ## Model gateway
 
 `internal/model/nebius.go` speaks the OpenAI-compatible chat completions API
@@ -296,7 +323,7 @@ errors, 429s and 5xx with exponential backoff and full jitter (honouring
 ## Commands
 
 ```bash
-make up                 # Postgres (pgvector) + Temporal + Temporal UI
+make up                 # Postgres (pgvector), Temporal + UI, Obscura, SearXNG
 make down
 make migrate            # run pending migrations
 make migration name=x   # new migration file in db/migrations
@@ -309,7 +336,7 @@ make build              # build the frontend into public/build
 make serve              # Go server only, built assets
 make worker             # agent worker only (needs Temporal)
 make test               # go test -race ./...
-make smoke              # live Nebius call (chat + tool call); needs NEBIUS_TOKEN_FACTORY
+make smoke              # live Nebius call + web_search/browse on the compose services
 
 go test ./internal/agent -update    # regenerate reducer goldens
 cd web && npm run typecheck && npm run lint
@@ -319,8 +346,10 @@ cd web && npm run typecheck && npm run lint
 
 `.env` (copy `.env.example`): `POSTGRES_*`, `DATABASE_URL`,
 `NEBIUS_TOKEN_FACTORY` (required by the worker, which makes the model calls),
-optional `NEBIUS_MODEL`, `NEBIUS_BASE_URL` and `TEMPORAL_ADDRESS` (default
-`localhost:7233`). The server and worker also load `.env` themselves when
+`OBSCURA_CDP_TOKEN` (required by `make up` and the worker; `openssl rand -hex
+32`), optional `NEBIUS_MODEL`, `NEBIUS_BASE_URL`, `TEMPORAL_ADDRESS` (default
+`localhost:7233`), `OBSCURA_URL` (default `http://localhost:9222`) and
+`SEARXNG_URL` (default `http://localhost:8888`). The server and worker also load `.env` themselves when
 started without `make` (`internal/dotenv`); `go test` does not.
 
 | Port | What |
@@ -330,6 +359,8 @@ started without `make` (`internal/dotenv`); `go test` does not.
 | 5432 | Postgres |
 | 7233 | Temporal frontend (gRPC) |
 | 8088 | Temporal UI (not 8080, which is the Go server) |
+| 127.0.0.1:9222 | Obscura CDP (browse tool; needs the bearer token) |
+| 127.0.0.1:8888 | SearXNG (web_search tool) |
 
 ## Frontend
 
@@ -388,5 +419,11 @@ started without `make` (`internal/dotenv`); `go test` does not.
 - **Runs started before `events.append` existed** fail replay with a
   nondeterminism error (their histories have no event activities). Dev only;
   terminate them in the Temporal UI.
+- **Some sites serve bots an error page** (nature.com returned "Server
+  Error" to Obscura). It comes back as page content, not a tool error; the
+  model usually moves on to another source.
+- **Docker Compose needs `OBSCURA_CDP_TOKEN`** for every command (even
+  `docker compose exec db ...`), since compose.yml interpolates it. Keep it in
+  `.env`.
 - **Run test servers on another port** (e.g. `PORT=8091`) when `make dev` is
   already running; don't kill processes by name.
