@@ -6,6 +6,7 @@
 package temporalkernel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -18,6 +19,9 @@ import (
 
 	"nomanqureshi.dev/hpyo-agent/internal/kernel"
 )
+
+// TaskQueue is the queue agent runs are started on and workers poll.
+const TaskQueue = "hypo-agent"
 
 // Workflow is a registered workflow body.
 type Workflow = func(c kernel.Ctx, input []byte) ([]byte, error)
@@ -34,12 +38,17 @@ type Options struct {
 	MaxAttempts int32
 	// RetryInterval is the first backoff between attempts.
 	RetryInterval time.Duration
+	// HeartbeatTimeout is how fast a worker that died mid-activity is
+	// noticed. Registered activities heartbeat automatically; without this,
+	// a lost worker stalls the run for the whole ActivityTimeout.
+	HeartbeatTimeout time.Duration
 }
 
 var DefaultOptions = Options{
-	ActivityTimeout: 3 * time.Minute,
-	MaxAttempts:     3,
-	RetryInterval:   time.Second,
+	ActivityTimeout:  3 * time.Minute,
+	MaxAttempts:      3,
+	RetryInterval:    time.Second,
+	HeartbeatTimeout: 20 * time.Second,
 }
 
 // RegisterWorkflow registers wf under name on a worker (or a replayer).
@@ -47,9 +56,37 @@ func RegisterWorkflow(r worker.WorkflowRegistry, name string, wf Workflow, opts 
 	r.RegisterWorkflowWithOptions(Wrap(wf, opts), workflow.RegisterOptions{Name: name})
 }
 
-// RegisterActivity registers fn under name on a worker.
+// RegisterActivity registers fn under name on a worker. The registered
+// activity heartbeats while fn runs (see Options.HeartbeatTimeout).
 func RegisterActivity(r worker.ActivityRegistry, name string, fn kernel.ActivityFunc) {
-	r.RegisterActivityWithOptions(fn, activity.RegisterOptions{Name: name})
+	r.RegisterActivityWithOptions(heartbeating(fn), activity.RegisterOptions{Name: name})
+}
+
+// heartbeating reports liveness while fn runs, so Temporal notices a dead
+// worker within the heartbeat timeout. Activity bodies like a model call are
+// one blocking request and can't heartbeat themselves.
+func heartbeating(fn kernel.ActivityFunc) kernel.ActivityFunc {
+	return func(ctx context.Context, input []byte) ([]byte, error) {
+		if every := activity.GetInfo(ctx).HeartbeatTimeout / 3; every > 0 {
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				t := time.NewTicker(every)
+				defer t.Stop()
+				for {
+					select {
+					case <-t.C:
+						activity.RecordHeartbeat(ctx)
+					case <-done:
+						return
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+		}
+		return fn(ctx, input)
+	}
 }
 
 // Wrap turns a kernel workflow into a Temporal workflow function.
@@ -79,6 +116,7 @@ func (c *workflowCtx) Call(step, activityName string, input []byte) ([]byte, err
 	ctx := workflow.WithActivityOptions(c.ctx, workflow.ActivityOptions{
 		ActivityID:          step,
 		StartToCloseTimeout: c.opts.ActivityTimeout,
+		HeartbeatTimeout:    c.opts.HeartbeatTimeout,
 		RetryPolicy: &temporal.RetryPolicy{
 			InitialInterval: c.opts.RetryInterval,
 			MaximumAttempts: c.opts.MaxAttempts,

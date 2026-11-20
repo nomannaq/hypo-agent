@@ -55,6 +55,13 @@ type Runner struct {
 	Limits Limits
 }
 
+// WorkflowName is the name the agent workflow is registered and started
+// under. The server starts it; the worker registers it.
+const WorkflowName = "agent"
+
+// SystemPrompt is the agent's system prompt.
+const SystemPrompt = "You are Hypo, a helpful research assistant. Be concise and clear."
+
 // The activities a run calls. Names are part of every journal: renaming one
 // breaks replay of runs recorded under the old name.
 var (

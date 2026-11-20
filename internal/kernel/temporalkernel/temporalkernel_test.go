@@ -77,7 +77,7 @@ func newHarness(t *testing.T) *harness {
 		queue:  id,
 		prefix: id + "-",
 		// Short timeouts so a killed worker's activity is retried quickly.
-		opts:       temporalkernel.Options{ActivityTimeout: 3 * time.Second, MaxAttempts: 3, RetryInterval: 100 * time.Millisecond},
+		opts:       temporalkernel.Options{ActivityTimeout: 10 * time.Second, MaxAttempts: 3, RetryInterval: 100 * time.Millisecond, HeartbeatTimeout: time.Second},
 		workflows:  map[string]temporalkernel.Workflow{},
 		activities: map[string]kernel.ActivityFunc{},
 		started:    map[string]bool{},

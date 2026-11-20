@@ -1,4 +1,5 @@
-package main
+// Package dotenv loads .env for binaries started without `make`.
+package dotenv
 
 import (
 	"bufio"
@@ -6,9 +7,9 @@ import (
 	"strings"
 )
 
-// loadDotEnv sets variables from .env that are not already in the environment,
-// so the server also works when started without `make`.
-func loadDotEnv(path string) {
+// Load sets variables from the file at path that are not already in the
+// environment, so a binary also works when started without `make`.
+func Load(path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return

@@ -1,0 +1,14 @@
+# Worker hot reload: `make dev` runs this next to the server's .air.toml.
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/worker ./cmd/worker"
+  entrypoint = ["./tmp/worker"]
+  include_ext = ["go"]
+  exclude_dir = ["tmp", "public", "web", "db/migrations", ".idea"]
+  exclude_regex = ["_test\\.go$"]
+  delay = 200
+
+[log]
+  main_only = true
