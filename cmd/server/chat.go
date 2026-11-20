@@ -49,6 +49,9 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	runner := &executor.Runner{Model: s.model, System: chatSystemPrompt}
 	k := memkernel.New()
 	k.Register("agent", runner.Workflow)
+	for name, fn := range runner.Activities() {
+		k.RegisterActivity(name, fn)
+	}
 	input, _ := json.Marshal(executor.Input{History: history[:n-1], Prompt: history[n-1].Text})
 	out, err := k.Run(r.Context(), rand.Text(), "agent", input)
 	if err != nil {

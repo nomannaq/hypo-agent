@@ -44,11 +44,68 @@ var DefaultLimits = Limits{
 	StepTimeout:   2 * time.Minute,
 }
 
+// Runner holds both halves of an agent run: workflow-side config (System,
+// Limits, the tool specs offered to the model) used by Workflow/Run, and
+// activity-side dependencies (Model, Tools) used by Activities. On Temporal
+// the two halves run in different places; the worker registers both.
 type Runner struct {
 	Model  Model
 	Tools  Tools // nil: the model is offered no tools
 	System string
 	Limits Limits
+}
+
+// The activities a run calls. Names are part of every journal: renaming one
+// breaks replay of runs recorded under the old name.
+var (
+	modelActivity = kernel.Activity[model.Request, model.Response]{Name: "model.complete"}
+	toolActivity  = kernel.Activity[toolInput, toolResult]{Name: "tool.call"}
+)
+
+type toolInput struct {
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
+}
+
+func (r *Runner) limits() Limits {
+	if r.Limits == (Limits{}) {
+		return DefaultLimits
+	}
+	return r.Limits
+}
+
+// Activities returns the activity bodies this runner's workflow calls, keyed
+// by name. Register them with the kernel (or Temporal worker) that runs it.
+func (r *Runner) Activities() map[string]kernel.ActivityFunc {
+	lim := r.limits()
+	return map[string]kernel.ActivityFunc{
+		modelActivity.Name: modelActivity.Func(func(ctx context.Context, req model.Request) (model.Response, error) {
+			ctx, cancel := context.WithTimeout(ctx, lim.StepTimeout)
+			defer cancel()
+			return r.Model.Complete(ctx, req)
+		}),
+		// Tool failures (handler error, timeout) are results the model gets to
+		// see, so they return a nil error and get journaled like any output.
+		toolActivity.Name: toolActivity.Func(func(ctx context.Context, in toolInput) (toolResult, error) {
+			if r.Tools == nil {
+				return toolResult{Output: fmt.Sprintf("unknown tool %q", in.Name), IsError: true}, nil
+			}
+			parent := ctx
+			ctx, cancel := context.WithTimeout(ctx, lim.StepTimeout)
+			defer cancel()
+			out, err := r.Tools.Call(ctx, in.Name, in.Args)
+			if err != nil {
+				if parent.Err() != nil {
+					return toolResult{}, parent.Err() // the worker is going away: not a tool failure
+				}
+				return toolResult{Output: err.Error(), IsError: true}, nil
+			}
+			if len(out) > lim.MaxToolOutput {
+				out = out[:lim.MaxToolOutput] + "\n…[truncated]"
+			}
+			return toolResult{Output: out}, nil
+		}),
+	}
 }
 
 type Input struct {
@@ -72,17 +129,14 @@ func (r *Runner) Workflow(c kernel.Ctx, input []byte) ([]byte, error) {
 
 // Run drives one turn: model -> tool calls -> results -> model ... until the
 // model answers without tools or a guard trips. Every model and tool call is a
-// kernel Step, so a resumed run replays them instead of calling again.
+// kernel activity call, so a resumed run replays them instead of calling again.
 //
 // The returned error is only for the kernel's own failures (cancellation,
 // i.e. a crash or shutdown, and nondeterminism), which mean "resume or fix the
 // code", not "the agent failed". Model errors and guards end in State.Status ==
 // agent.Stopped.
 func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
-	lim := r.Limits
-	if lim == (Limits{}) {
-		lim = DefaultLimits
-	}
+	lim := r.limits()
 	var specs []model.Tool
 	if r.Tools != nil {
 		specs = r.Tools.Specs()
@@ -116,13 +170,9 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 				continue
 			}
 			req := model.Request{Messages: toModel(r.System, s.Messages), Tools: specs}
-			resp, err := kernel.StepT(c, fmt.Sprintf("model/%d", s.Turns), func(ctx context.Context) (model.Response, error) {
-				ctx, cancel := context.WithTimeout(ctx, lim.StepTimeout)
-				defer cancel()
-				return r.Model.Complete(ctx, req)
-			})
+			resp, err := kernel.Call(c, fmt.Sprintf("model/%d", s.Turns), modelActivity, req)
 			if err != nil {
-				if fatal(c, err) {
+				if fatal(err) {
 					return s, err
 				}
 				if err := fail("model: " + err.Error()); err != nil {
@@ -147,7 +197,7 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 
 		case agent.Acting:
 			call := s.Pending[0]
-			res, err := r.callTool(c, s.Turns, call, lim)
+			res, err := r.callTool(c, s.Turns, call, specs)
 			if err != nil {
 				return s, err
 			}
@@ -166,35 +216,20 @@ type toolResult struct {
 	IsError bool   `json:"is_error"`
 }
 
-// callTool runs one tool call as a Step. Tool failures (unknown tool, handler
-// error, timeout) are results the model gets to see, not run failures.
-func (r *Runner) callTool(c kernel.Ctx, turn int, call agent.ToolCall, lim Limits) (toolResult, error) {
-	if r.Tools == nil || !offered(r.Tools.Specs(), call.Name) {
+// callTool runs one tool call as an activity. An unknown tool is answered
+// here, without a call: the model sees the error and can recover.
+func (r *Runner) callTool(c kernel.Ctx, turn int, call agent.ToolCall, specs []model.Tool) (toolResult, error) {
+	if !offered(specs, call.Name) {
 		return toolResult{Output: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}, nil
 	}
-	// Model call IDs can repeat across turns, so the turn is part of the name.
-	res, err := kernel.StepT(c, fmt.Sprintf("tool/%d/%s", turn, call.ID), func(ctx context.Context) (toolResult, error) {
-		ctx, cancel := context.WithTimeout(ctx, lim.StepTimeout)
-		defer cancel()
-		out, err := r.Tools.Call(ctx, call.Name, call.Args)
-		if err != nil {
-			if c.Err() != nil {
-				return toolResult{}, c.Err() // crash/shutdown: don't journal
-			}
-			return toolResult{Output: err.Error(), IsError: true}, nil
-		}
-		if len(out) > lim.MaxToolOutput {
-			out = out[:lim.MaxToolOutput] + "\n…[truncated]"
-		}
-		return toolResult{Output: out}, nil
-	})
-	return res, err
+	// Model call IDs can repeat across turns, so the turn is part of the step.
+	return kernel.Call(c, fmt.Sprintf("tool/%d/%s", turn, call.ID), toolActivity, toolInput{Name: call.Name, Args: call.Args})
 }
 
 // fatal reports errors that must stop the loop instead of becoming a Failed
 // event: the run was cancelled (crash, shutdown) or replay diverged.
-func fatal(c kernel.Ctx, err error) bool {
-	return c.Err() != nil || errors.Is(err, kernel.ErrNondeterminism)
+func fatal(err error) bool {
+	return errors.Is(err, kernel.ErrCanceled) || errors.Is(err, kernel.ErrNondeterminism)
 }
 
 func offered(specs []model.Tool, name string) bool {

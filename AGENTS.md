@@ -67,7 +67,7 @@ UI over SSE; memory and skills plug in as tools.
 2. `cmd/server/chat.go` validates it, builds an `executor.Input` (history +
    prompt), creates a fresh `memkernel`, and runs the `agent` workflow.
 3. `executor.Run` folds events through `agent.Reduce`, calling the model (and
-   tools, once there are any) as journaled Steps until the state is `done` or
+   tools, once there are any) as journaled activity calls until the state is `done` or
    `failed`.
 4. The server returns the last assistant message as `{"reply": ...}`.
 
@@ -84,14 +84,13 @@ cmd/
   worker-activity/ Temporal activity worker (stub)
 internal/
   agent/           pure State × Event -> State; no I/O imports
-  kernel/          the durability contract (Ctx, Future, StepT, sentinel errors)
+  kernel/          the durability contract (Ctx, Activity, Call, sentinel errors)
     memkernel/     in-memory implementation (tests, dev, per-request runs)
     pgkernel/      Postgres-journal implementation (stub, learning path)
     temporalkernel/ Temporal adapter (stub, production path)
     conformance/   one suite every kernel must pass
   executor/        agent loop: reducer + kernel + model + tools, with guards
   model/           Nebius client: tool calling, retries, usage metering
-  stepreg/         name -> step function registry (for Temporal activities)
   tool/ runtime/ memory/   stubs for roadmap Steps 2-5
 db/migrations/     goose SQL migrations (users/sessions, pgkernel tables)
 web/               Vite + React frontend (see "Frontend" below)
@@ -107,12 +106,22 @@ returns its recorded result instead of running again. That only works if the
 workflow code is **deterministic**: the same journal must produce the same
 sequence of calls.
 
-- **Every side effect is a Step.** Model calls, tool calls and anything with
-  I/O go inside `c.Step` / `kernel.StepT`. Code outside a Step re-runs on every
-  replay.
+- **Every side effect is an activity.** Model calls, tool calls and anything
+  with I/O are registered activities, called from workflow code with
+  `kernel.Call(c, step, activity, input)`: a named
+  `kernel.Activity[In, Out]` with explicit, JSON-serializable input. Closures
+  are not steps: Temporal can only run registered activities, and a closure
+  can't carry its input across processes. Code outside an activity re-runs on
+  every replay.
+- **Register what the workflow calls.** Whoever runs a workflow (a kernel in
+  tests, the worker in production) registers its activities too: the executor
+  exposes them as `Runner.Activities()`.
 - **Never call `time.Now()`, `rand`, or read the environment in workflow
-  code.** Use `c.Now()` and `c.Rand()`, which are journaled. Inside a Step body
-  it's fine: the body runs once and its result is recorded.
+  code.** Use `c.Now()` and `c.Rand()`, which are journaled. Inside an activity
+  body it's fine: the body runs once and its result is recorded.
+- **`kernel.Ctx` is not a `context.Context`.** Workflow code can't use Go
+  context semantics (they don't replay, and Temporal's workflow context isn't
+  one). Activity bodies get a real `context.Context`.
 - **No goroutines in workflow code.** Parallelism goes through `c.Spawn`
   (child runs), so the kernel can journal it.
 - **Step names must be deterministic and unique per run.** The executor uses
@@ -121,22 +130,26 @@ sequence of calls.
 - **Changing code under a live run is a nondeterminism bug.** Replay that
   reaches a journal entry recorded by a different call fails with
   `kernel.ErrNondeterminism`. Fail loudly; never paper over it.
-- **A cancelled run is a crash, not a failure.** If the run's context ends
-  mid-Step, nothing is journaled, so the next run re-executes that Step.
-  `executor.Run` returns kernel errors (cancellation, nondeterminism) as
+- **A cancelled run is a crash, not a failure.** If the run stops mid-call
+  (worker lost, shutdown), nothing is journaled, the call returns an error
+  wrapping `kernel.ErrCanceled`, and the next run re-executes it.
+  `executor.Run` returns kernel errors (`ErrCanceled`, `ErrNondeterminism`) as
   errors; agent-level failures (model error, guard tripped) end the run in the
   `failed` state with a nil error.
+- **Activity names are part of the journal.** Renaming an activity (or a step
+  name pattern) breaks replay of runs recorded under the old name.
 - **The journal records results, not side effects.** A crash between a side
   effect and its journal write repeats the effect. External writes need an
   idempotency key (`runID:seq`); that's the tool ledger in Step 2.
-- **Temporal adds two constraints** (Step 4): Step bodies must be registered
-  activities (dispatched by name through `internal/stepreg`), and long runs
-  need Continue-As-New (`kernel.ContinueAsNewer`, a no-op on other kernels).
+- **Long runs on Temporal need Continue-As-New** (`kernel.ContinueAsNewer`, a
+  no-op on other kernels). Deferred while a run is a single turn; see
+  `.junie/plans/durability.md`.
 
 ### Conformance suite
 
 `internal/kernel/conformance` is the definition of correct kernel behaviour:
-step replay, crash-mid-step resume, nondeterminism detection, stable
+call replay, resume after losing the worker mid-call (`Harness.Restart`),
+nondeterminism detection, stable
 `Now`/`Rand`, signals (including ones sent before `Await`), timeouts, sleep
 skipped on replay, and spawned children. Every kernel calls
 `conformance.Run` from its own `_test.go`. A new kernel is done when this
@@ -225,7 +238,7 @@ package that imports both `agent` and `kernel`.
 
 Guards (`executor.Limits`, defaults in `DefaultLimits`): max model turns, a
 token budget, max tool calls per model reply, a cap on tool output kept in
-context, and a timeout per Step. A tripped guard ends the run in `failed`
+context, and a timeout per model or tool call. A tripped guard ends the run in `failed`
 with a reason; it is never a Go error.
 
 Tool failures (unknown tool, malformed arguments, handler error, timeout) go

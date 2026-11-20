@@ -46,9 +46,17 @@ func toolCall(id, name, args string) model.ToolCall {
 	return model.ToolCall{ID: id, Type: "function", Function: model.FunctionCall{Name: name, Arguments: args}}
 }
 
+// register wires a runner into a kernel the way a worker does.
+func register(k *memkernel.Kernel, r *Runner) {
+	k.Register("agent", r.Workflow)
+	for name, fn := range r.Activities() {
+		k.RegisterActivity(name, fn)
+	}
+}
+
 func run(t *testing.T, k *memkernel.Kernel, r *Runner, runID, prompt string) (agent.State, error) {
 	t.Helper()
-	k.Register("agent", r.Workflow)
+	register(k, r)
 	in, _ := json.Marshal(Input{Prompt: prompt})
 	out, err := k.Run(t.Context(), runID, "agent", in)
 	if err != nil {
@@ -107,7 +115,7 @@ func TestRunResumesAfterCrashWithoutRepeatingSteps(t *testing.T) {
 	}}
 	k := memkernel.New()
 	r := &Runner{Model: m, Tools: tools}
-	k.Register("agent", r.Workflow)
+	register(k, r)
 	in, _ := json.Marshal(Input{Prompt: "go"})
 
 	if _, err := k.Run(ctx, "r1", "agent", in); !errors.Is(err, context.Canceled) {

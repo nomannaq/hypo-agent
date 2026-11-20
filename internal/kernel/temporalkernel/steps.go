@@ -1,7 +1,6 @@
 package temporalkernel
 
-// TODO: a single generic Activity ("RunStep") registered on
-// cmd/worker-activity. It takes (stepName string, payload []byte), looks
-// stepName up in internal/stepreg, and runs it. Ctx.Step on this kernel
-// calls workflow.ExecuteActivity against this one activity rather than the
-// closure it was given — the closure only matters to memkernel/pgkernel.
+// TODO: Ctx.Call -> workflow.ExecuteActivity by registered name, with
+// per-activity timeouts and a retry policy (MaximumAttempts 3; non-retryable
+// application errors for 4xx/bad input). Activities are registered on the
+// worker from executor.Runner.Activities(); there is no closure dispatch.

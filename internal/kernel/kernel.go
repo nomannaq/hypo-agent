@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
 	"time"
 )
@@ -16,24 +17,39 @@ var (
 	// ErrTimeout is returned by Await when no signal arrives in time.
 	ErrTimeout = errors.New("kernel: await timed out")
 	// ErrNondeterminism means replay reached a journal entry recorded by a
-	// different call (another step name, or a Sleep where a Step was). The
-	// workflow code changed under a live run; continuing would corrupt it.
+	// different call (another step or activity name, or a Sleep where a Call
+	// was). The workflow code changed under a live run; continuing would
+	// corrupt it.
 	ErrNondeterminism = errors.New("kernel: nondeterministic replay")
+	// ErrCanceled means the run stopped mid-call (worker crash, shutdown,
+	// cancellation). Nothing was journaled for that call, so resuming the run
+	// executes it again. It is never an agent-level failure.
+	ErrCanceled = errors.New("kernel: run canceled")
 )
 
-// Ctx is the only contract between the runtime and the durability engine.
+// ActivityFunc is a registered activity body: the only place a workflow may
+// do I/O. It runs at most once per (run, step) as far as the workflow can
+// tell, and receives a real context.Context.
+type ActivityFunc = func(ctx context.Context, input []byte) ([]byte, error)
+
+// Ctx is what workflow code sees. Workflow code must be deterministic: it
+// does I/O only through Call, and gets time and randomness only from Now and
+// Rand. Ctx is deliberately not a context.Context: Temporal's workflow
+// context isn't one, and Go context semantics (Done channels, goroutines)
+// don't replay.
+//
 // Implementations: memkernel (tests), pgkernel, temporalkernel.
 type Ctx interface {
-	context.Context
-
 	// RunID identifies this run (one agent session).
 	RunID() string
 
-	// Step runs fn at most once per (RunID, name) and journals its result.
-	// On replay, the journaled result is returned and fn is not called
-	// again. A name reused with a different input is a nondeterminism bug;
-	// implementations should fail loudly rather than silently diverge.
-	Step(name string, fn func(context.Context) ([]byte, error)) ([]byte, error)
+	// Call runs the activity registered as activity with input, at most once
+	// per (RunID, step), and journals its result. On replay the journaled
+	// result is returned and the activity is not called again. A step name
+	// reused for a different activity is a nondeterminism bug; kernels fail
+	// with ErrNondeterminism rather than silently diverge. If the run stops
+	// mid-call, Call returns an error wrapping ErrCanceled.
+	Call(step, activity string, input []byte) ([]byte, error)
 
 	// Sleep is a durable timer: it survives worker restarts and crashes.
 	Sleep(d time.Duration) error
@@ -45,12 +61,12 @@ type Ctx interface {
 	// Spawn starts a child run (a sub-agent) and returns a handle to it.
 	Spawn(workflow string, input []byte) (Future, error)
 
-	// Now returns the journaled, replay-safe clock. Calling time.Now()
-	// directly inside a Step body breaks replay — use this instead.
+	// Now returns the journaled, replay-safe clock. Never call time.Now() in
+	// workflow code.
 	Now() time.Time
 
-	// Rand returns a journaled, replay-safe random source. An unseeded
-	// math/rand.Rand used directly inside a Step body breaks replay.
+	// Rand returns a journaled, replay-safe random source. Never use an
+	// unseeded math/rand.Rand in workflow code.
 	Rand() *rand.Rand
 }
 
@@ -68,23 +84,41 @@ type ContinueAsNewer interface {
 	ContinueAsNew(input []byte) error
 }
 
-// StepT is a typed wrapper around Ctx.Step for callers that don't want to
-// hand-marshal []byte.
-func StepT[T any](c Ctx, name string, fn func(context.Context) (T, error)) (T, error) {
-	var zero T
-	out, err := c.Step(name, func(sc context.Context) ([]byte, error) {
-		v, err := fn(sc)
+// Activity names an activity and fixes its input and output types, so the
+// call site (Call) and the registration (Func) can't disagree on them.
+type Activity[In, Out any] struct {
+	Name string
+}
+
+// Func wraps a typed body as the ActivityFunc kernels register, with JSON as
+// the wire format.
+func (a Activity[In, Out]) Func(fn func(context.Context, In) (Out, error)) ActivityFunc {
+	return func(ctx context.Context, input []byte) ([]byte, error) {
+		var in In
+		if err := json.Unmarshal(input, &in); err != nil {
+			return nil, fmt.Errorf("activity %s: bad input: %w", a.Name, err)
+		}
+		out, err := fn(ctx, in)
 		if err != nil {
 			return nil, err
 		}
-		return json.Marshal(v)
-	})
+		return json.Marshal(out)
+	}
+}
+
+// Call is the typed form of Ctx.Call.
+func Call[In, Out any](c Ctx, step string, a Activity[In, Out], in In) (Out, error) {
+	var out Out
+	input, err := json.Marshal(in)
 	if err != nil {
-		return zero, err
+		return out, fmt.Errorf("activity %s: encoding input: %w", a.Name, err)
 	}
-	var v T
-	if err := json.Unmarshal(out, &v); err != nil {
-		return zero, err
+	raw, err := c.Call(step, a.Name, input)
+	if err != nil {
+		return out, err
 	}
-	return v, nil
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("activity %s: decoding output: %w", a.Name, err)
+	}
+	return out, nil
 }

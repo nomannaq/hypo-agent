@@ -7,6 +7,7 @@ package memkernel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -19,7 +20,7 @@ import (
 type Workflow = func(c kernel.Ctx, input []byte) ([]byte, error)
 
 type entry struct {
-	kind   string // "step/<name>", "sleep", "await/<signal>", "spawn/<workflow>", "join/<child>", "now", "rand"
+	kind   string // "call/<step>/<activity>", "sleep", "await/<signal>", "spawn/<workflow>", "join/<child>", "now", "rand"
 	output []byte
 	err    error
 }
@@ -31,20 +32,28 @@ type child struct {
 }
 
 type Kernel struct {
-	mu        sync.Mutex
-	workflows map[string]Workflow
-	journals  map[string][]entry
-	signals   map[string]chan []byte // key: runID + "\x00" + signal name
-	children  map[string]*child
+	mu         sync.Mutex
+	workflows  map[string]Workflow
+	activities map[string]kernel.ActivityFunc
+	journals   map[string][]entry
+	signals    map[string]chan []byte // key: runID + "\x00" + signal name
+	children   map[string]*child
+
+	// root is cancelled by Restart: every run in flight derives from it.
+	root   context.Context
+	cancel context.CancelFunc
 }
 
 func New() *Kernel {
-	return &Kernel{
-		workflows: map[string]Workflow{},
-		journals:  map[string][]entry{},
-		signals:   map[string]chan []byte{},
-		children:  map[string]*child{},
+	k := &Kernel{
+		workflows:  map[string]Workflow{},
+		activities: map[string]kernel.ActivityFunc{},
+		journals:   map[string][]entry{},
+		signals:    map[string]chan []byte{},
+		children:   map[string]*child{},
 	}
+	k.root, k.cancel = context.WithCancel(context.Background())
+	return k
 }
 
 func (k *Kernel) Register(name string, wf Workflow) {
@@ -53,16 +62,37 @@ func (k *Kernel) Register(name string, wf Workflow) {
 	k.workflows[name] = wf
 }
 
+func (k *Kernel) RegisterActivity(name string, fn kernel.ActivityFunc) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.activities[name] = fn
+}
+
+// Restart simulates losing the worker: every run and activity in flight is
+// cancelled, and nothing they were doing is journaled. Journals survive, so
+// running the same runID again resumes it.
+func (k *Kernel) Restart() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.cancel()
+	k.root, k.cancel = context.WithCancel(context.Background())
+}
+
 // Run executes workflow as runID. Running the same runID again replays its
-// journal: recorded steps return their results without re-running.
+// journal: recorded calls return their results without re-running.
 func (k *Kernel) Run(ctx context.Context, runID, workflow string, input []byte) ([]byte, error) {
 	k.mu.Lock()
 	wf, ok := k.workflows[workflow]
+	root := k.root
 	k.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("memkernel: workflow %q not registered", workflow)
 	}
-	return wf(&runCtx{Context: ctx, k: k, runID: runID}, input)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(root, cancel)
+	defer stop()
+	return wf(&runCtx{ctx: ctx, k: k, runID: runID}, input)
 }
 
 // Signal delivers payload to runID's Await(name). Signals sent before the
@@ -88,8 +118,9 @@ func (k *Kernel) signal(runID, name string) chan []byte {
 	return ch
 }
 
-// startChild runs a spawned child once; later calls (replay) reuse it.
-func (k *Kernel) startChild(ctx context.Context, id, workflow string, input []byte) *child {
+// startChild runs a spawned child once; later calls (replay) reuse it. A
+// child killed by Restart is forgotten, so the next replay runs it again.
+func (k *Kernel) startChild(id, workflow string, input []byte) *child {
 	k.mu.Lock()
 	ch, ok := k.children[id]
 	if !ok {
@@ -100,15 +131,20 @@ func (k *Kernel) startChild(ctx context.Context, id, workflow string, input []by
 	if !ok {
 		go func() {
 			defer close(ch.done)
-			// The child outlives the parent's call stack, not its cancellation.
-			ch.out, ch.err = k.Run(context.WithoutCancel(ctx), id, workflow, input)
+			// The child outlives the parent's call stack; Restart still stops it.
+			ch.out, ch.err = k.Run(context.Background(), id, workflow, input)
+			if errors.Is(ch.err, kernel.ErrCanceled) {
+				k.mu.Lock()
+				delete(k.children, id)
+				k.mu.Unlock()
+			}
 		}()
 	}
 	return ch
 }
 
 type runCtx struct {
-	context.Context
+	ctx   context.Context
 	k     *Kernel
 	runID string
 	seq   int
@@ -116,6 +152,10 @@ type runCtx struct {
 }
 
 func (c *runCtx) RunID() string { return c.runID }
+
+func (c *runCtx) canceled() error {
+	return fmt.Errorf("%w: %w", kernel.ErrCanceled, c.ctx.Err())
+}
 
 // record is the whole durability model: the n-th journaled call of a run gets
 // journal[n]. If it exists, its result is returned (replay), after checking it
@@ -139,8 +179,8 @@ func (c *runCtx) record(kind string, fn func() ([]byte, error)) ([]byte, error) 
 	c.k.mu.Unlock()
 
 	out, err := fn()
-	if c.Err() != nil {
-		return nil, c.Err()
+	if c.ctx.Err() != nil {
+		return nil, c.canceled()
 	}
 	c.k.mu.Lock()
 	c.k.journals[c.runID] = append(c.k.journals[c.runID], entry{kind: kind, output: out, err: err})
@@ -148,8 +188,14 @@ func (c *runCtx) record(kind string, fn func() ([]byte, error)) ([]byte, error) 
 	return out, err
 }
 
-func (c *runCtx) Step(name string, fn func(context.Context) ([]byte, error)) ([]byte, error) {
-	return c.record("step/"+name, func() ([]byte, error) { return fn(c) })
+func (c *runCtx) Call(step, activity string, input []byte) ([]byte, error) {
+	c.k.mu.Lock()
+	fn, ok := c.k.activities[activity]
+	c.k.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("memkernel: activity %q not registered", activity)
+	}
+	return c.record("call/"+step+"/"+activity, func() ([]byte, error) { return fn(c.ctx, input) })
 }
 
 func (c *runCtx) Sleep(d time.Duration) error {
@@ -157,8 +203,8 @@ func (c *runCtx) Sleep(d time.Duration) error {
 		select {
 		case <-time.After(d):
 			return nil, nil
-		case <-c.Done():
-			return nil, c.Err()
+		case <-c.ctx.Done():
+			return nil, c.canceled()
 		}
 	})
 	return err
@@ -171,8 +217,8 @@ func (c *runCtx) Await(signal string, timeout time.Duration) ([]byte, error) {
 			return p, nil
 		case <-time.After(timeout):
 			return nil, kernel.ErrTimeout
-		case <-c.Done():
-			return nil, c.Err()
+		case <-c.ctx.Done():
+			return nil, c.canceled()
 		}
 	})
 }
@@ -182,7 +228,7 @@ func (c *runCtx) Spawn(workflow string, input []byte) (kernel.Future, error) {
 	if _, err := c.record("spawn/"+workflow, func() ([]byte, error) { return []byte(id), nil }); err != nil {
 		return nil, err
 	}
-	return &future{id: id, ch: c.k.startChild(c, id, workflow, input)}, nil
+	return &future{id: id, ch: c.k.startChild(id, workflow, input)}, nil
 }
 
 // Now and Rand can't return an error, so a nondeterministic replay panics:
@@ -234,8 +280,8 @@ func (f *future) Get(ctx kernel.Ctx) ([]byte, error) {
 		select {
 		case <-f.ch.done:
 			return f.ch.out, f.ch.err
-		case <-c.Done():
-			return nil, c.Err()
+		case <-c.ctx.Done():
+			return nil, c.canceled()
 		}
 	})
 }

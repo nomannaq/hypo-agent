@@ -1,10 +1,9 @@
-// Command worker-activity hosts the Temporal activity worker: the generic
-// RunStep activity (internal/kernel/temporalkernel), which dispatches to
-// internal/stepreg by name. This is where model calls and tool execution
-// actually happen — separate task queue, separate pool from the workflow
-// worker. Not wired up yet.
+// Command worker-activity is superseded: the durability plan
+// (.junie/plans/durability.md) replaces worker-workflow and worker-activity
+// with a single cmd/worker that registers the agent workflow and the
+// activities from executor.Runner.Activities(). Not wired up yet.
 package main
 
 func main() {
-	panic("TODO: wire temporalkernel's activity worker")
+	panic("TODO: replaced by cmd/worker (durability plan, step 3)")
 }
