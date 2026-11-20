@@ -36,23 +36,25 @@ Inertia (gonertia) + React 19 + Tailwind 4 frontend, Nebius Token Factory
 | `internal/kernel/conformance` | **Done**: 8 tests, run against both kernels, mutation-checked |
 | `internal/model`: Nebius client | **Done**: tool calling, retry/backoff, `OnUsage` metering, live smoke test |
 | `internal/executor`: agent loop | **Done**: guards, crash-resume test |
-| `cmd/server`: auth, sessions, `/api/chat` | **Done**: chat starts a durable Temporal run and waits for it |
-| `cmd/worker` | **Done**: runs agent workflows and activities; survives being killed mid-run |
-| Web UI: beUI chat shell, orb, messages, activity | **Done**; replies are not streamed yet |
+| `cmd/server`: auth, sessions, runs | **Done**: `POST /api/runs` starts a durable run; `GET /api/runs/{id}/events` streams its events (SSE) |
+| `cmd/worker` | **Done**: runs agent workflows and activities, persists run events; survives being killed mid-run |
+| Web UI: beUI chat shell, orb, messages, activity | **Done**: follows runs step by step, reattaches after a reload |
 | `internal/tool`, `internal/runtime`, `internal/memory` | Stubs (roadmap Steps 2–5) |
 | `pgkernel` | Stub (learning path, time-boxed) |
 | Run scheduler, supervisor (rest of Step 4) | Stubs in `internal/runtime` |
 | `skills/`, `sandbox/images/` | Empty (Steps 2 and 6) |
 
-Roadmap Step 1 (agent core) and the durable-execution part of Step 4 are
-complete (see `.junie/plans/durability.md`). Next: Step 3 (stream runs to the
-UI over SSE) and Step 2 (tool registry, then approvals via `Await`).
+Roadmap Steps 1 (agent core) and 3 (streaming runs to the UI), and the
+durable-execution part of Step 4, are complete (see
+`.junie/plans/durability.md`). Next: Step 2 (tool registry, then approvals via
+`Await`).
 
 ## Architecture
 
 ```
-web (React/Inertia) ──POST /api/chat──▶ cmd/server ──start workflow──▶ Temporal
-                                                                       │
+web (React/Inertia) ──POST /api/runs──▶ cmd/server ──start workflow──▶ Temporal
+        ▲                                   ▲                          │
+        └──SSE /api/runs/{id}/events────────┤ LISTEN run_events        │
                                                          cmd/worker (polls hypo-agent)
                                                                        │
                                                kernel.Ctx = temporalkernel
@@ -63,34 +65,45 @@ web (React/Inertia) ──POST /api/chat──▶ cmd/server ──start workflo
                      (pure reducer)  (Nebius) (registry, Step 2)
 ```
 
-Target (from the roadmap): the server starts a durable run on the runtime
-scheduler; the run's events are persisted (`run_events`) and streamed to the
-UI over SSE; memory and skills plug in as tools.
+Each run's events land in `run_events` (written by the worker's
+`events.append` activity) and reach the UI over SSE. Target (from the roadmap):
+runs go through the runtime scheduler; memory and skills plug in as tools.
 
 ### Request flow today
 
-1. `web/src/pages/agent.tsx` POSTs the whole conversation to `/api/chat`.
-2. `cmd/server/chat.go` validates it, builds an `executor.Input` (history +
-   prompt), and starts the `agent` workflow on Temporal (task queue
-   `hypo-agent`, workflow ID `run-<random>`), then waits for its result.
-3. `cmd/worker` runs it: `executor.Run` folds events through `agent.Reduce`,
+1. `web/src/pages/agent.tsx` POSTs the whole conversation to `/api/runs`.
+2. `cmd/server/runs.go` validates it, records the run in `agent_runs` (owned
+   by the user), starts the `agent` workflow on Temporal (task queue
+   `hypo-agent`, workflow ID = run ID `run-<random>`), and returns
+   `{"id": ...}` without waiting.
+3. The page opens `GET /api/runs/{id}/events` (an `EventSource`).
+4. `cmd/worker` runs it: `executor.Run` folds events through `agent.Reduce`,
    calling the model (and tools, once there are any) as activities until the
-   state is `done` or `failed`. Each activity result is recorded in the
-   workflow's Temporal history.
-4. The server returns the last assistant message as `{"reply": ...}`.
+   state is `done` or `failed`. After every event it calls the
+   `events.append` activity, which inserts `(run_id, seq, event)` into
+   `run_events`; an insert trigger sends `NOTIFY run_events`.
+5. The server holds one `LISTEN run_events` connection (`hub` in `runs.go`)
+   and wakes the run's streams, which re-read the table and send new events as
+   `id: <seq>` / `data: <agent.Event>`. Each stream folds what it sends
+   through `agent.Reduce` and closes with `event: end` once the run is `done`
+   or `failed`.
 
 The run lives on the worker, not in the request. If the worker dies mid-call,
 the activity's heartbeat stops, Temporal notices within the heartbeat timeout
 (20s) and retries the call on another worker; completed calls are replayed
-from history, not repeated. If the browser disconnects, the run still finishes,
-but the UI can't reattach to it yet (Step 3). `memkernel` is now used only in
-tests.
+from history, not repeated. If the browser disconnects, `EventSource`
+reconnects with `Last-Event-ID` and gets only what it missed; after a reload
+the page restores the conversation from `sessionStorage` and reattaches to
+runs still in progress. If a run ends without a final event (terminated,
+nondeterminism, Postgres down past the append retries), the stream notices on
+its next 15s ping (it asks Temporal) and sends `event: error`. `memkernel` is
+now used only in tests.
 
 ## Repo map
 
 ```
 cmd/
-  server/          HTTP + Inertia app: auth, sessions, settings, /api/chat, `seed` subcommand
+  server/          HTTP + Inertia app: auth, sessions, settings, runs + SSE, `seed` subcommand
   migrate/         goose CLI (migrations embedded from db/)
   worker/          Temporal worker: the agent workflow + its activities
 internal/
@@ -104,7 +117,7 @@ internal/
   model/           Nebius client: tool calling, retries, usage metering
   dotenv/          .env loader for binaries started without make
   tool/ runtime/ memory/   stubs for roadmap Steps 2-5
-db/migrations/     goose SQL migrations (users/sessions, pgkernel tables)
+db/migrations/     goose SQL migrations (users/sessions, pgkernel tables, agent_runs/run_events)
 web/               Vite + React frontend (see "Frontend" below)
 skills/ sandbox/   future skills and tool sandbox images
 .junie/plans/      the roadmap
@@ -137,7 +150,7 @@ sequence of calls.
 - **No goroutines in workflow code.** Parallelism goes through `c.Spawn`
   (child runs), so the kernel can journal it.
 - **Step names must be deterministic and unique per run.** The executor uses
-  `model/<turn>` and `tool/<turn>/<callID>` (model call IDs can repeat across
+  `model/<turn>`, `tool/<turn>/<callID>` and `event/<seq>` (model call IDs can repeat across
   turns, so the turn is part of the name).
 - **Changing code under a live run is a nondeterminism bug.** Replay that
   reaches a journal entry recorded by a different call fails with
@@ -152,7 +165,8 @@ sequence of calls.
   name pattern) breaks replay of runs recorded under the old name.
 - **The journal records results, not side effects.** A crash between a side
   effect and its journal write repeats the effect. External writes need an
-  idempotency key (`runID:seq`); that's the tool ledger in Step 2.
+  idempotency key (`runID:seq`): `events.append` writes `(run_id, seq)` with
+  `ON CONFLICT DO NOTHING`; tools get the same through the ledger in Step 2.
 - **Long runs on Temporal need Continue-As-New** (`kernel.ContinueAsNewer`, a
   no-op on other kernels). Deferred while a run is a single turn; see
   `.junie/plans/durability.md`.
@@ -252,8 +266,8 @@ the same pattern:
 5. If the serialized state legitimately changed, regenerate goldens with
    `go test ./internal/agent -update` and review the diff.
 
-Events will be persisted (`run_events`, Step 3), so renaming an event's or a
-status's string is a data migration, not a refactor.
+Events are persisted (`run_events`) and replayed by the stream, so renaming
+an event's or a status's string is a data migration, not a refactor.
 
 ## Executor loop and guards
 
@@ -368,5 +382,11 @@ started without `make` (`internal/dotenv`); `go test` does not.
   `make goose cmd=...`.
 - **Model replies render raw markdown** in the chat UI for now (`**bold**`,
   `-` lists).
+- **Replies arrive per step, not per token.** An activity only returns its
+  final result, so the reply appears when the model call completes. Token
+  streaming would be a separate, non-durable channel.
+- **Runs started before `events.append` existed** fail replay with a
+  nondeterminism error (their histories have no event activities). Dev only;
+  terminate them in the Temporal UI.
 - **Run test servers on another port** (e.g. `PORT=8091`) when `make dev` is
   already running; don't kill processes by name.
