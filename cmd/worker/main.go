@@ -6,12 +6,15 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"log"
 	"os"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
+	"nomanqureshi.dev/hpyo-agent/internal/agent"
 	"nomanqureshi.dev/hpyo-agent/internal/dotenv"
 	"nomanqureshi.dev/hpyo-agent/internal/executor"
 	"nomanqureshi.dev/hpyo-agent/internal/kernel/temporalkernel"
@@ -27,9 +30,22 @@ func main() {
 	}
 	defer c.Close()
 
+	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
 	runner := &executor.Runner{
 		Model:  model.NewClient(os.Getenv("NEBIUS_TOKEN_FACTORY"), os.Getenv("NEBIUS_BASE_URL"), os.Getenv("NEBIUS_MODEL")),
 		System: executor.SystemPrompt,
+		// The append can be retried after it landed; the (run_id, seq) key
+		// makes the retry a no-op. The insert trigger wakes the server's streams.
+		Events: func(ctx context.Context, runID string, seq int, e agent.Event) error {
+			_, err := db.Exec(ctx, `INSERT INTO run_events (run_id, seq, event) VALUES ($1, $2, $3)
+				ON CONFLICT DO NOTHING`, runID, seq, e)
+			return err
+		},
 	}
 	w := worker.New(c, temporalkernel.TaskQueue, worker.Options{})
 	temporalkernel.RegisterWorkflow(w, executor.WorkflowName, runner.Workflow, temporalkernel.DefaultOptions)

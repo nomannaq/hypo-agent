@@ -53,6 +53,9 @@ type Runner struct {
 	Tools  Tools // nil: the model is offered no tools
 	System string
 	Limits Limits
+	// Events persists a run's events (run_events) so the UI can stream them.
+	// Activity side, like Model. nil: events aren't persisted (tests).
+	Events func(ctx context.Context, runID string, seq int, e agent.Event) error
 }
 
 // WorkflowName is the name the agent workflow is registered and started
@@ -67,7 +70,14 @@ const SystemPrompt = "You are Hypo, a helpful research assistant. Be concise and
 var (
 	modelActivity = kernel.Activity[model.Request, model.Response]{Name: "model.complete"}
 	toolActivity  = kernel.Activity[toolInput, toolResult]{Name: "tool.call"}
+	eventActivity = kernel.Activity[eventInput, struct{}]{Name: "events.append"}
 )
+
+type eventInput struct {
+	RunID string      `json:"run_id"`
+	Seq   int         `json:"seq"`
+	Event agent.Event `json:"event"`
+}
 
 type toolInput struct {
 	Name string          `json:"name"`
@@ -112,6 +122,14 @@ func (r *Runner) Activities() map[string]kernel.ActivityFunc {
 			}
 			return toolResult{Output: out}, nil
 		}),
+		// A retried append writes the same (run, seq), so Events must ignore
+		// duplicates: the activity can run again after its write landed.
+		eventActivity.Name: eventActivity.Func(func(ctx context.Context, in eventInput) (struct{}, error) {
+			if r.Events == nil {
+				return struct{}{}, nil
+			}
+			return struct{}{}, r.Events(ctx, in.RunID, in.Seq, in.Event)
+		}),
 	}
 }
 
@@ -149,13 +167,31 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 		specs = r.Tools.Specs()
 	}
 
-	s, err := agent.Reduce(agent.Start(in.History), agent.Event{Kind: agent.UserMessage, Text: in.Prompt})
-	if err != nil {
+	s := agent.Start(in.History)
+	// apply folds e into s and, if events are persisted, appends it as the
+	// run's next event. The seq is the event's index in this run, so it is
+	// the same on every replay.
+	seq := 0
+	apply := func(e agent.Event) error {
+		next, err := agent.Reduce(s, e)
+		if err != nil {
+			return err
+		}
+		s = next
+		if r.Events == nil {
+			return nil
+		}
+		// ponytail: a failed append (Postgres down past the retries) fails the
+		// workflow; the stream reports it as a run that ended without a reply.
+		_, err = kernel.Call(c, fmt.Sprintf("event/%d", seq), eventActivity, eventInput{RunID: c.RunID(), Seq: seq, Event: e})
+		seq++
+		return err
+	}
+	if err := apply(agent.Event{Kind: agent.UserMessage, Text: in.Prompt}); err != nil {
 		return s, err
 	}
 	fail := func(reason string) error {
-		s, err = agent.Reduce(s, agent.Event{Kind: agent.Failed, Err: reason})
-		return err
+		return apply(agent.Event{Kind: agent.Failed, Err: reason})
 	}
 
 	for {
@@ -193,7 +229,7 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 				}
 				continue
 			}
-			if s, err = agent.Reduce(s, agent.Event{
+			if err := apply(agent.Event{
 				Kind:      agent.ModelReply,
 				Text:      resp.Content,
 				ToolCalls: fromModel(resp.ToolCalls),
@@ -208,7 +244,7 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 			if err != nil {
 				return s, err
 			}
-			if s, err = agent.Reduce(s, agent.Event{Kind: agent.ToolResult, CallID: call.ID, Text: res.Output, IsError: res.IsError}); err != nil {
+			if err := apply(agent.Event{Kind: agent.ToolResult, CallID: call.ID, Text: res.Output, IsError: res.IsError}); err != nil {
 				return s, err
 			}
 

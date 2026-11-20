@@ -22,6 +22,7 @@ type server struct {
 	db       *pgxpool.Pool
 	app      *inertia.ViteInstance
 	temporal client.Client
+	hub      *hub
 }
 
 func main() {
@@ -63,7 +64,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{db: db, app: app, temporal: tc}
+	s := &server{db: db, app: app, temporal: tc, hub: newHub()}
+	go s.hub.listen(db.Config().ConnConfig)
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /build/", http.StripPrefix("/build/", http.FileServer(http.Dir("public/build"))))
@@ -76,7 +78,8 @@ func main() {
 	mux.HandleFunc("POST /logout", s.logout)
 
 	mux.HandleFunc("GET /agent", s.authOnly(s.page("agent")))
-	mux.HandleFunc("POST /api/chat", s.authOnly(s.chat))
+	mux.HandleFunc("POST /api/runs", s.authOnly(s.startRun))
+	mux.HandleFunc("GET /api/runs/{id}/events", s.authOnly(s.runEvents))
 	mux.Handle("GET /settings", http.RedirectHandler("/settings/profile", http.StatusFound))
 	mux.HandleFunc("GET /settings/profile", s.authOnly(s.page("settings/profile")))
 	mux.HandleFunc("PATCH /settings/profile", s.authOnly(s.updateProfile))
