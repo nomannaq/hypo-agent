@@ -1,0 +1,26 @@
+{
+  "status": "done",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Hi"
+    },
+    {
+      "role": "assistant",
+      "text": "Hello!"
+    },
+    {
+      "role": "user",
+      "text": "Summarize our chat."
+    },
+    {
+      "role": "assistant",
+      "text": "You said hi."
+    }
+  ],
+  "turns": 1,
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  }
+}

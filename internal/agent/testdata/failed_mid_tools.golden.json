@@ -1,0 +1,25 @@
+{
+  "status": "failed",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Go"
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "fetch",
+          "args": {}
+        }
+      ]
+    }
+  ],
+  "turns": 1,
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  },
+  "err": "turn limit reached"
+}
