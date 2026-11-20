@@ -1,7 +1,7 @@
 include .env
 export
 
-.PHONY: up down migrate rollback status migration goose seed fresh dev serve build
+.PHONY: up down migrate rollback status migration goose seed fresh dev serve build test smoke
 
 up:            ; docker compose up -d --wait
 down:          ; docker compose down
@@ -22,3 +22,5 @@ serve:         ; go run ./cmd/server
 seed:          ; go run ./cmd/server seed
 fresh:         ; go run ./cmd/migrate reset && go run ./cmd/migrate up && go run ./cmd/server seed
 build:         ; cd web && npm run build
+test:          ; go test -race ./...
+smoke:         ; go test -count=1 -v -run Smoke ./internal/model   # real Nebius call

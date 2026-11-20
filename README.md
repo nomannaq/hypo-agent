@@ -2,6 +2,8 @@
 
 An agentic loop for hypothesis research and validation.
 
+**Working on the code?** Read [AGENTS.md](AGENTS.md) first: architecture, durability rules, the agent state machine, and conventions.
+
 Go + Postgres (pgvector) backend, Inertia (gonertia) + React + shadcn/ui frontend.
 
 ## Setup
@@ -54,9 +56,9 @@ cd web && npm run format                # kit style: 4 spaces, single quotes
 
 ## How it fits together
 
-- `cmd/server/main.go` renders pages: `app.Render(w, r, "dashboard", inertia.Props{...})`.
-- `"dashboard"` maps to `web/src/pages/dashboard.tsx`. Layouts are picked by page name
-  in `web/src/app.tsx` (`auth/*` → auth layout, `settings/*` → settings layout, else app layout).
+- `cmd/server/main.go` renders pages: `app.Render(w, r, "agent", inertia.Props{...})`.
+- `"agent"` maps to `web/src/pages/agent.tsx`. Layouts are picked by page name
+  in `web/src/app.tsx` (`auth/*` → auth layout, `settings/*` → agent shell + settings layout, else the agent shell in `layouts/agent-layout.tsx`).
 - `web/app.html` is the root template.
 - In dev, Vite writes `public/hot` so the server loads assets from the Vite dev server.
 - Go hot reload: [air](https://github.com/air-verse/air), config in `.air.toml`, pinned in `go.mod`
@@ -72,12 +74,12 @@ The frontend is the [Laravel React starter kit](https://github.com/laravel/react
 |---|---|
 | `/` | `pages/welcome.tsx` |
 | `/login`, `/register` | `pages/auth/*` (guest only) |
-| `/dashboard` | `pages/dashboard.tsx` (auth) |
+| `/agent` | `pages/agent.tsx` (auth) |
 | `/settings/profile`, `/settings/security`, `/settings/appearance` | `pages/settings/*` (auth) |
 
 - Routes and handlers: `cmd/server/main.go`; sessions + password hashing: `cmd/server/auth.go`.
 - Shared props on every page: `auth.user`, `name`, `sidebarOpen` (from the `sidebar_state` cookie).
-- `web/src/routes/` stands in for Laravel Wayfinder (`dashboard()`, `store.form()`, ...).
+- `web/src/routes/` stands in for Laravel Wayfinder (`agent()`, `store.form()`, ...).
   Add a route there when you add one in `main.go`.
 - Seeders: `cmd/server/seed.go` (keep inserts idempotent, e.g. `ON CONFLICT DO NOTHING`).
 - Validation errors: re-render the page via `s.invalid(...)`; the kit's `<Form>` picks up `errors`.
