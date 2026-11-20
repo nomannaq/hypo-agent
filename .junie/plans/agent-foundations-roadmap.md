@@ -91,11 +91,11 @@ A run can execute a model -> tool -> result loop in-process, journaled via memke
 
 Done: `make test` (reducer goldens, memkernel conformance, executor crash-resume + guards), `make smoke` (live Nebius chat + tool call). `/api/chat` runs through the executor on a per-request memkernel.
 
-### * Step 2: Tool registry and first tools
+### ✓ Step 2: Tool registry and first tools
 The executor resolves tool calls from a registry with effect types, idempotency keys and approvals.
 
 - 2a ✓ `internal/tool` registry (implements `executor.Tools`) and the first read-only tools: `web_search` (SearXNG, compose) and `browse` (Obscura headless browser over CDP, compose; page → Markdown, private addresses refused). Live smoke tests; worker-loss mid-browse resumes without repeating the model call.
-- 2b: effects and idempotency ledger, approval via `kernel.Ctx.Await` in `internal/runtime/approval.go`, first write tools.
+- 2b ✓ `tool.Effect` (Read/Write); approvals via `kernel.Ctx.Await` in the executor (new `waiting` status, `approval_requested`/`approval_decided` events, `POST /api/runs/{id}/approvals`, beUI approval card); idempotency ledger (`tool_ledger`, `Runner.Ledger`); first write tool `submit_form` plus `inspect_forms`. Approval lives in the executor, not `internal/runtime`: it is part of the agent loop.
 - Later: sandbox runner using `sandbox/images`; interactive browsing (click, type) on Obscura.
 
 ### ✓ Step 3: Stream runs to the chat UI

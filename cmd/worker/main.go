@@ -48,13 +48,17 @@ func main() {
 	runner := &executor.Runner{
 		Model:  model.NewClient(os.Getenv("NEBIUS_TOKEN_FACTORY"), os.Getenv("NEBIUS_BASE_URL"), os.Getenv("NEBIUS_MODEL")),
 		System: executor.SystemPrompt,
-		// Tools on the compose services (`make up`). submit_form is a Write
-		// tool: each call waits for the user's approval.
+		// Tools on the compose services (`make up`). Browser tools are
+		// session-based: browser_open creates a session, then browser_snapshot,
+		// browser_click, browser_type, and browser_press act on it. Clicks and
+		// typing are Write tools: each call waits for the user's approval.
 		Tools: tool.Registry{
 			tool.WebSearch(cmp.Or(os.Getenv("SEARXNG_URL"), "http://localhost:8888")),
-			tool.Browse(obscura, obscuraToken),
-			tool.InspectForms(obscura, obscuraToken),
-			tool.SubmitForm(obscura, obscuraToken),
+			tool.BrowserOpen(obscura, obscuraToken),
+			tool.BrowserSnapshot(),
+			tool.BrowserClick(),
+			tool.BrowserType(),
+			tool.BrowserPress(),
 		},
 		// The append can be retried after it landed; the (run_id, seq) key
 		// makes the retry a no-op. The insert trigger wakes the server's streams.
