@@ -19,6 +19,7 @@ const (
 	Idle     Status = iota // waiting for a user message
 	Thinking               // needs a model call
 	Acting                 // has tool calls waiting for results
+	Waiting                // a tool call with side effects needs the user's approval
 	Done                   // the model answered without tool calls
 	Stopped                // ended by a Failed event; terminal
 
@@ -29,6 +30,7 @@ var statusNames = [...]string{
 	Idle:     "idle",
 	Thinking: "thinking",
 	Acting:   "acting",
+	Waiting:  "waiting",
 	Done:     "done",
 	Stopped:  "failed",
 }
@@ -71,12 +73,15 @@ func (s *Status) UnmarshalText(b []byte) error {
 //	                            done     (it doesn't)
 //	acting   --tool_result--->  acting   (calls still pending)
 //	                            thinking (that was the last one)
+//	acting   --approval_requested--> waiting (a call with side effects)
+//	waiting  --approval_decided--->  acting  (approved or not; then its tool_result)
 //	done     --user_message-->  thinking (the next turn)
 //	any but failed --failed-->  failed   (terminal)
 var transitions = [numStatuses]map[EventKind][]Status{
 	Idle:     {UserMessage: {Thinking}, Failed: {Stopped}},
 	Thinking: {ModelReply: {Acting, Done}, Failed: {Stopped}},
-	Acting:   {ToolResult: {Acting, Thinking}, Failed: {Stopped}},
+	Acting:   {ToolResult: {Acting, Thinking}, ApprovalRequested: {Waiting}, Failed: {Stopped}},
+	Waiting:  {ApprovalDecided: {Acting}, Failed: {Stopped}},
 	Done:     {UserMessage: {Thinking}, Failed: {Stopped}},
 	Stopped:  {},
 }
@@ -102,8 +107,9 @@ type Message struct {
 type State struct {
 	Status   Status     `json:"status"`
 	Messages []Message  `json:"messages"`
-	Pending  []ToolCall `json:"pending,omitempty"` // calls still awaiting a ToolResult, in model order
-	Turns    int        `json:"turns"`             // model calls so far
+	Pending  []ToolCall `json:"pending,omitempty"`  // calls still awaiting a ToolResult, in model order
+	Awaiting string     `json:"awaiting,omitempty"` // while Waiting: the call the user is asked to approve
+	Turns    int        `json:"turns"`              // model calls so far
 	Usage    Usage      `json:"usage"`
 	Err      string     `json:"err,omitempty"`
 }
@@ -163,10 +169,25 @@ func Reduce(s State, e Event) (State, error) {
 			next.Status = Thinking
 		}
 
+	case ApprovalRequested:
+		if !slices.ContainsFunc(s.Pending, func(c ToolCall) bool { return c.ID == e.CallID }) {
+			return s, fmt.Errorf("agent: approval requested for unknown call %q", e.CallID)
+		}
+		next.Awaiting = e.CallID
+		next.Status = Waiting
+
+	case ApprovalDecided:
+		if e.CallID != s.Awaiting {
+			return s, fmt.Errorf("agent: approval decided for call %q, but %q is awaiting", e.CallID, s.Awaiting)
+		}
+		next.Awaiting = ""
+		next.Status = Acting
+
 	case Failed:
 		next.Status = Stopped
 		next.Err = e.Err
 		next.Pending = nil
+		next.Awaiting = ""
 	}
 
 	if !slices.Contains(allowed, next.Status) {

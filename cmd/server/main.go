@@ -80,6 +80,7 @@ func main() {
 	mux.HandleFunc("GET /agent", s.authOnly(s.page("agent")))
 	mux.HandleFunc("POST /api/runs", s.authOnly(s.startRun))
 	mux.HandleFunc("GET /api/runs/{id}/events", s.authOnly(s.runEvents))
+	mux.HandleFunc("POST /api/runs/{id}/approvals", s.authOnly(s.decideApproval))
 	mux.Handle("GET /settings", http.RedirectHandler("/settings/profile", http.StatusFound))
 	mux.HandleFunc("GET /settings/profile", s.authOnly(s.page("settings/profile")))
 	mux.HandleFunc("PATCH /settings/profile", s.authOnly(s.updateProfile))

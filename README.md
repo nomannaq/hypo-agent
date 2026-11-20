@@ -10,6 +10,7 @@ Go + Postgres (pgvector) backend, Inertia (gonertia) + React + shadcn/ui fronten
 
 ```bash
 cp .env.example .env
+# in .env: set NEBIUS_TOKEN_FACTORY, and OBSCURA_CDP_TOKEN to `openssl rand -hex 32`
 cd web && npm install && cd ..
 make up
 make migrate
@@ -21,8 +22,8 @@ make dev        # http://localhost:8080
 
 **Database (Docker)**
 ```bash
-make up                 # start Postgres + pgvector
-make down               # stop it
+make up                 # start Postgres + pgvector, Temporal + UI, Obscura (browser), SearXNG (search)
+make down               # stop them
 docker compose down -v  # stop it and wipe the data
 ```
 
