@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,18 +13,19 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	inertia "github.com/romsar/gonertia/v2"
+	"go.temporal.io/sdk/client"
 
-	"nomanqureshi.dev/hpyo-agent/internal/model"
+	"nomanqureshi.dev/hpyo-agent/internal/dotenv"
 )
 
 type server struct {
-	db    *pgxpool.Pool
-	app   *inertia.ViteInstance
-	model *model.Client
+	db       *pgxpool.Pool
+	app      *inertia.ViteInstance
+	temporal client.Client
 }
 
 func main() {
-	loadDotEnv(".env")
+	dotenv.Load(".env")
 	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
@@ -55,11 +57,13 @@ func main() {
 	if err := app.ShareTemplateFunc("reactRefresh", reactRefresh); err != nil {
 		log.Fatal(err)
 	}
-	s := &server{
-		db:    db,
-		app:   app,
-		model: model.NewClient(os.Getenv("NEBIUS_TOKEN_FACTORY"), os.Getenv("NEBIUS_BASE_URL"), os.Getenv("NEBIUS_MODEL")),
+	// Lazy: the app (auth, settings) works while Temporal is down; only
+	// starting a run needs it.
+	tc, err := client.NewLazyClient(client.Options{HostPort: cmp.Or(os.Getenv("TEMPORAL_ADDRESS"), "localhost:7233")})
+	if err != nil {
+		log.Fatal(err)
 	}
+	s := &server{db: db, app: app, temporal: tc}
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /build/", http.StripPrefix("/build/", http.FileServer(http.Dir("public/build"))))

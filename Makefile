@@ -1,7 +1,7 @@
 include .env
 export
 
-.PHONY: up down migrate rollback status migration goose seed fresh dev serve build test smoke
+.PHONY: up down migrate rollback status migration goose seed fresh dev serve worker build test smoke
 
 up:            ; docker compose up -d --wait
 down:          ; docker compose down
@@ -11,14 +11,16 @@ status:        ; go run ./cmd/migrate status
 migration:     ; go run ./cmd/migrate create $(name)
 goose:         ; go run ./cmd/migrate $(cmd)
 
-# Vite must be up first: the server picks dev vs built assets at boot via public/hot.
+# Vite + the agent worker + the server, each hot-reloading. Needs `make up` (Temporal).
 dev:
 	@trap 'kill 0' EXIT; \
 	(cd web && npx vite) & \
+	go tool air -c .air.worker.toml & \
 	until [ -f public/hot ]; do sleep 0.2; done; \
 	go tool air
 
 serve:         ; go run ./cmd/server
+worker:        ; go run ./cmd/worker
 seed:          ; go run ./cmd/server seed
 fresh:         ; go run ./cmd/migrate reset && go run ./cmd/migrate up && go run ./cmd/server seed
 build:         ; cd web && npm run build

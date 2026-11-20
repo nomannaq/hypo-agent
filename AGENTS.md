@@ -32,25 +32,31 @@ Inertia (gonertia) + React 19 + Tailwind 4 frontend, Nebius Token Factory
 | `internal/agent`: reducer, events, state machine | **Done**: golden + exhaustive state-machine tests |
 | `internal/kernel`: `Ctx` contract | **Done** |
 | `internal/kernel/memkernel` | **Done**: passes the conformance suite |
-| `internal/kernel/conformance` | **Done**: 8 tests, mutation-checked |
+| `internal/kernel/temporalkernel` | **Done**: passes the same suite on a Temporal dev server, plus a worker-loss chaos test |
+| `internal/kernel/conformance` | **Done**: 8 tests, run against both kernels, mutation-checked |
 | `internal/model`: Nebius client | **Done**: tool calling, retry/backoff, `OnUsage` metering, live smoke test |
 | `internal/executor`: agent loop | **Done**: guards, crash-resume test |
-| `cmd/server`: auth, sessions, `/api/chat` | **Done**: chat runs through the executor on a per-request memkernel |
+| `cmd/server`: auth, sessions, `/api/chat` | **Done**: chat starts a durable Temporal run and waits for it |
+| `cmd/worker` | **Done**: runs agent workflows and activities; survives being killed mid-run |
 | Web UI: beUI chat shell, orb, messages, activity | **Done**; replies are not streamed yet |
 | `internal/tool`, `internal/runtime`, `internal/memory` | Stubs (roadmap Steps 2–5) |
-| `pgkernel`, `temporalkernel`, `cmd/worker-*` | Stubs (Step 4). Worker `main`s `panic("TODO")` |
+| `pgkernel` | Stub (learning path, time-boxed) |
+| Run scheduler, supervisor (rest of Step 4) | Stubs in `internal/runtime` |
 | `skills/`, `sandbox/images/` | Empty (Steps 2 and 6) |
 
-Roadmap Step 1 (agent core) is complete. Next: Step 2 (tool registry) and
-Step 3 (stream runs to the UI over SSE).
+Roadmap Step 1 (agent core) and the durable-execution part of Step 4 are
+complete (see `.junie/plans/durability.md`). Next: Step 3 (stream runs to the
+UI over SSE) and Step 2 (tool registry, then approvals via `Await`).
 
 ## Architecture
 
 ```
-web (React/Inertia) ──POST /api/chat──▶ cmd/server
-                                           │
-                                   kernel.Ctx (memkernel today, Temporal later)
-                                           │
+web (React/Inertia) ──POST /api/chat──▶ cmd/server ──start workflow──▶ Temporal
+                                                                       │
+                                                         cmd/worker (polls hypo-agent)
+                                                                       │
+                                               kernel.Ctx = temporalkernel
+                                                                       │
                                    internal/executor  ◀── the only package that
                                    │     │      │          wires everything
                      internal/agent   model   tools
@@ -65,14 +71,20 @@ UI over SSE; memory and skills plug in as tools.
 
 1. `web/src/pages/agent.tsx` POSTs the whole conversation to `/api/chat`.
 2. `cmd/server/chat.go` validates it, builds an `executor.Input` (history +
-   prompt), creates a fresh `memkernel`, and runs the `agent` workflow.
-3. `executor.Run` folds events through `agent.Reduce`, calling the model (and
-   tools, once there are any) as journaled Steps until the state is `done` or
-   `failed`.
+   prompt), and starts the `agent` workflow on Temporal (task queue
+   `hypo-agent`, workflow ID `run-<random>`), then waits for its result.
+3. `cmd/worker` runs it: `executor.Run` folds events through `agent.Reduce`,
+   calling the model (and tools, once there are any) as activities until the
+   state is `done` or `failed`. Each activity result is recorded in the
+   workflow's Temporal history.
 4. The server returns the last assistant message as `{"reply": ...}`.
 
-Nothing is persisted yet: a fresh kernel per request means a server crash
-loses the turn. That is expected until Step 4.
+The run lives on the worker, not in the request. If the worker dies mid-call,
+the activity's heartbeat stops, Temporal notices within the heartbeat timeout
+(20s) and retries the call on another worker; completed calls are replayed
+from history, not repeated. If the browser disconnects, the run still finishes,
+but the UI can't reattach to it yet (Step 3). `memkernel` is now used only in
+tests.
 
 ## Repo map
 
@@ -80,18 +92,17 @@ loses the turn. That is expected until Step 4.
 cmd/
   server/          HTTP + Inertia app: auth, sessions, settings, /api/chat, `seed` subcommand
   migrate/         goose CLI (migrations embedded from db/)
-  worker-workflow/ Temporal workflow worker (stub)
-  worker-activity/ Temporal activity worker (stub)
+  worker/          Temporal worker: the agent workflow + its activities
 internal/
   agent/           pure State × Event -> State; no I/O imports
-  kernel/          the durability contract (Ctx, Future, StepT, sentinel errors)
-    memkernel/     in-memory implementation (tests, dev, per-request runs)
+  kernel/          the durability contract (Ctx, Activity, Call, sentinel errors)
+    memkernel/     in-memory implementation (tests)
     pgkernel/      Postgres-journal implementation (stub, learning path)
-    temporalkernel/ Temporal adapter (stub, production path)
+    temporalkernel/ Temporal adapter (production): conformance + chaos tests
     conformance/   one suite every kernel must pass
   executor/        agent loop: reducer + kernel + model + tools, with guards
   model/           Nebius client: tool calling, retries, usage metering
-  stepreg/         name -> step function registry (for Temporal activities)
+  dotenv/          .env loader for binaries started without make
   tool/ runtime/ memory/   stubs for roadmap Steps 2-5
 db/migrations/     goose SQL migrations (users/sessions, pgkernel tables)
 web/               Vite + React frontend (see "Frontend" below)
@@ -107,12 +118,22 @@ returns its recorded result instead of running again. That only works if the
 workflow code is **deterministic**: the same journal must produce the same
 sequence of calls.
 
-- **Every side effect is a Step.** Model calls, tool calls and anything with
-  I/O go inside `c.Step` / `kernel.StepT`. Code outside a Step re-runs on every
-  replay.
+- **Every side effect is an activity.** Model calls, tool calls and anything
+  with I/O are registered activities, called from workflow code with
+  `kernel.Call(c, step, activity, input)`: a named
+  `kernel.Activity[In, Out]` with explicit, JSON-serializable input. Closures
+  are not steps: Temporal can only run registered activities, and a closure
+  can't carry its input across processes. Code outside an activity re-runs on
+  every replay.
+- **Register what the workflow calls.** Whoever runs a workflow (a kernel in
+  tests, the worker in production) registers its activities too: the executor
+  exposes them as `Runner.Activities()`.
 - **Never call `time.Now()`, `rand`, or read the environment in workflow
-  code.** Use `c.Now()` and `c.Rand()`, which are journaled. Inside a Step body
-  it's fine: the body runs once and its result is recorded.
+  code.** Use `c.Now()` and `c.Rand()`, which are journaled. Inside an activity
+  body it's fine: the body runs once and its result is recorded.
+- **`kernel.Ctx` is not a `context.Context`.** Workflow code can't use Go
+  context semantics (they don't replay, and Temporal's workflow context isn't
+  one). Activity bodies get a real `context.Context`.
 - **No goroutines in workflow code.** Parallelism goes through `c.Spawn`
   (child runs), so the kernel can journal it.
 - **Step names must be deterministic and unique per run.** The executor uses
@@ -121,27 +142,44 @@ sequence of calls.
 - **Changing code under a live run is a nondeterminism bug.** Replay that
   reaches a journal entry recorded by a different call fails with
   `kernel.ErrNondeterminism`. Fail loudly; never paper over it.
-- **A cancelled run is a crash, not a failure.** If the run's context ends
-  mid-Step, nothing is journaled, so the next run re-executes that Step.
-  `executor.Run` returns kernel errors (cancellation, nondeterminism) as
+- **A cancelled run is a crash, not a failure.** If the run stops mid-call
+  (worker lost, shutdown), nothing is journaled, the call returns an error
+  wrapping `kernel.ErrCanceled`, and the next run re-executes it.
+  `executor.Run` returns kernel errors (`ErrCanceled`, `ErrNondeterminism`) as
   errors; agent-level failures (model error, guard tripped) end the run in the
   `failed` state with a nil error.
+- **Activity names are part of the journal.** Renaming an activity (or a step
+  name pattern) breaks replay of runs recorded under the old name.
 - **The journal records results, not side effects.** A crash between a side
   effect and its journal write repeats the effect. External writes need an
   idempotency key (`runID:seq`); that's the tool ledger in Step 2.
-- **Temporal adds two constraints** (Step 4): Step bodies must be registered
-  activities (dispatched by name through `internal/stepreg`), and long runs
-  need Continue-As-New (`kernel.ContinueAsNewer`, a no-op on other kernels).
+- **Long runs on Temporal need Continue-As-New** (`kernel.ContinueAsNewer`, a
+  no-op on other kernels). Deferred while a run is a single turn; see
+  `.junie/plans/durability.md`.
 
 ### Conformance suite
 
 `internal/kernel/conformance` is the definition of correct kernel behaviour:
-step replay, crash-mid-step resume, nondeterminism detection, stable
+call replay, resume after losing the worker mid-call (`Harness.Restart`),
+nondeterminism detection, stable
 `Now`/`Rand`, signals (including ones sent before `Await`), timeouts, sleep
 skipped on replay, and spawned children. Every kernel calls
 `conformance.Run` from its own `_test.go`. A new kernel is done when this
-suite passes, not before. The suite has been checked against a deliberately
-broken kernel (replay disabled), which fails 5 of the 8 tests.
+suite passes, not before.
+
+It has been checked against deliberately broken kernels: memkernel with replay
+disabled fails 5 of the 8 tests; temporalkernel with an unjournaled `Now`, an
+unjournaled `Rand` seed, or no step-name activity ID each fails the intended
+test.
+
+On Temporal the suite runs on a hermetic dev server
+(`testsuite.StartDevServer`; the CLI is downloaded on first run, and the tests
+skip with a message if it can't start). Re-running a finished run replays its
+history against the current code and returns that code's own result.
+
+`internal/kernel/temporalkernel/chaos_test.go` runs the real executor on
+Temporal and stops the worker mid-tool-call; a new worker must finish the run
+without calling the model again for the completed turn.
 
 ## The agent state machine
 
@@ -225,7 +263,7 @@ package that imports both `agent` and `kernel`.
 
 Guards (`executor.Limits`, defaults in `DefaultLimits`): max model turns, a
 token budget, max tool calls per model reply, a cap on tool output kept in
-context, and a timeout per Step. A tripped guard ends the run in `failed`
+context, and a timeout per model or tool call. A tripped guard ends the run in `failed`
 with a reason; it is never a Go error.
 
 Tool failures (unknown tool, malformed arguments, handler error, timeout) go
@@ -252,9 +290,10 @@ make rollback / status
 make goose cmd=reset    # any goose command (loads .env; plain `go run` doesn't)
 make seed               # test@example.com / password
 make fresh              # reset + migrate + seed (wipes the dev DB)
-make dev                # Vite + Go server with hot reload (air) → localhost:8080
+make dev                # Vite + worker + Go server, all hot-reloading → localhost:8080 (needs make up)
 make build              # build the frontend into public/build
 make serve              # Go server only, built assets
+make worker             # agent worker only (needs Temporal)
 make test               # go test -race ./...
 make smoke              # live Nebius call (chat + tool call); needs NEBIUS_TOKEN_FACTORY
 
@@ -265,9 +304,10 @@ cd web && npm run typecheck && npm run lint
 ## Environment and ports
 
 `.env` (copy `.env.example`): `POSTGRES_*`, `DATABASE_URL`,
-`NEBIUS_TOKEN_FACTORY` (required for the model), optional `NEBIUS_MODEL` and
-`NEBIUS_BASE_URL`. The server also loads `.env` itself when started without
-`make` (`cmd/server/dotenv.go`); `go test` does not.
+`NEBIUS_TOKEN_FACTORY` (required by the worker, which makes the model calls),
+optional `NEBIUS_MODEL`, `NEBIUS_BASE_URL` and `TEMPORAL_ADDRESS` (default
+`localhost:7233`). The server and worker also load `.env` themselves when
+started without `make` (`internal/dotenv`); `go test` does not.
 
 | Port | What |
 |---|---|
