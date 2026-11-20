@@ -114,7 +114,11 @@ func TestRunResumesAfterCrashWithoutRepeatingSteps(t *testing.T) {
 		return "ok", nil
 	}}
 	k := memkernel.New()
-	r := &Runner{Model: m, Tools: tools}
+	var appended []string // "seq:kind", as run_events would receive them
+	r := &Runner{Model: m, Tools: tools, Events: func(_ context.Context, runID string, seq int, e agent.Event) error {
+		appended = append(appended, fmt.Sprintf("%d:%s", seq, e.Kind))
+		return nil
+	}}
 	register(k, r)
 	in, _ := json.Marshal(Input{Prompt: "go"})
 
@@ -135,6 +139,12 @@ func TestRunResumesAfterCrashWithoutRepeatingSteps(t *testing.T) {
 	}
 	if tools.calls.Load() != 2 {
 		t.Errorf("tool called %d times, want 2 (crashed attempt + retry)", tools.calls.Load())
+	}
+	// Each event is appended once, in order: replay doesn't re-append the
+	// events recorded before the crash.
+	want := "0:user_message 1:model_reply 2:tool_result 3:model_reply"
+	if got := strings.Join(appended, " "); got != want {
+		t.Errorf("events appended %q, want %q", got, want)
 	}
 }
 

@@ -98,12 +98,13 @@ The executor resolves tool calls from a registry with effect types, idempotency 
 - Add approval via `kernel.Ctx.Await` in `internal/runtime/approval.go`.
 - Add first tools (web fetch, search) and the sandbox runner using `sandbox/images`.
 
-###   Step 3: Stream runs to the chat UI
+### ✓ Step 3: Stream runs to the chat UI
 The web agent page shows real streamed agent output instead of the fake reply.
 
-- Add `run_events` migration and event persistence.
-- Add server endpoints to start a run and stream via SSE with Last-Event-ID resume.
-- Replace `runAgent()` in `web/src/pages/agent.tsx`; render tool activity with `components/agents`.
+- ✓ Add `run_events` migration and event persistence (`events.append` activity, `(run_id, seq)` key, insert trigger → `NOTIFY`).
+- ✓ Add server endpoints to start a run and stream via SSE with Last-Event-ID resume; runs are owned by the user who started them.
+- ✓ Replace the blocking `/api/chat` in `web/src/pages/agent.tsx`; render model and tool steps with `AgentActivity`; reattach after a reload.
+- Later: token-by-token text (a non-durable side channel; activities only return final results), and conversations stored server-side instead of sessionStorage.
 
 ### * Step 4: Durable execution on Temporal
 Runs survive worker crashes and pass the conformance and chaos tests.
