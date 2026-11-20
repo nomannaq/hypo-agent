@@ -55,6 +55,25 @@ func TestReduceGolden(t *testing.T) {
 				{Kind: ModelReply, Text: "You said hi."},
 			},
 		},
+		"approval_declined": {
+			start: Start(nil),
+			events: []Event{
+				{Kind: UserMessage, Text: "Say hi through the contact form."},
+				{Kind: ModelReply, ToolCalls: []ToolCall{call("c1", "submit_form", `{"url":"https://example.com/contact"}`)}},
+				{Kind: ApprovalRequested, CallID: "c1"},
+				{Kind: ApprovalDecided, CallID: "c1", Text: "declined"},
+				{Kind: ToolResult, CallID: "c1", Text: "The user declined this action.", IsError: true},
+				{Kind: ModelReply, Text: "Okay, I won't send it."},
+			},
+		},
+		"waiting_for_approval": {
+			start: Start(nil),
+			events: []Event{
+				{Kind: UserMessage, Text: "Say hi through the contact form."},
+				{Kind: ModelReply, ToolCalls: []ToolCall{call("c1", "submit_form", `{"url":"https://example.com/contact"}`)}},
+				{Kind: ApprovalRequested, CallID: "c1"},
+			},
+		},
 		"failed_mid_tools": {
 			start: Start(nil),
 			events: []Event{
@@ -102,6 +121,7 @@ func TestReduceGolden(t *testing.T) {
 func TestReduceRejectsInvalidTransitions(t *testing.T) {
 	thinking, _ := Reduce(Start(nil), Event{Kind: UserMessage, Text: "x"})
 	acting, _ := Reduce(thinking, Event{Kind: ModelReply, ToolCalls: []ToolCall{call("c1", "t", `{}`)}})
+	waiting, _ := Reduce(acting, Event{Kind: ApprovalRequested, CallID: "c1"})
 
 	cases := map[string]struct {
 		s State
@@ -112,6 +132,9 @@ func TestReduceRejectsInvalidTransitions(t *testing.T) {
 		"unknown call id":            {acting, Event{Kind: ToolResult, CallID: "nope"}},
 		"prompt while acting":        {acting, Event{Kind: UserMessage, Text: "y"}},
 		"unknown kind":               {thinking, Event{Kind: EventKind(99)}},
+		"approval for unknown call":  {acting, Event{Kind: ApprovalRequested, CallID: "nope"}},
+		"tool result while waiting":  {waiting, Event{Kind: ToolResult, CallID: "c1"}},
+		"decision for another call":  {waiting, Event{Kind: ApprovalDecided, CallID: "c2"}},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
