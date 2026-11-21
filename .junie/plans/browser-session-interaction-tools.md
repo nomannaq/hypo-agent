@@ -133,6 +133,22 @@ graph LR
 - **Element index staleness:** The snapshot returns indices that may shift if the page changes between calls. Mitigation: the model should call `browser_snapshot` after each action to get fresh indices. The system prompt will emphasize this.
 - **CDP connection loss:** If Obscura restarts or the WebSocket drops, the session is stale. Mitigation: each tool call checks the connection and returns a clear error if dead, telling the model to call `browser_open` again.
 
+# Follow-up (feat/harness-tool-extension)
+
+Changed after review:
+- The run ID now comes from the executor through the call's context
+  (`tool.WithCall`), not a `run_id` argument: a model-chosen ID could reach
+  another run's (another user's) session.
+- `defer tool.CloseSession(...)` was removed from `executor.Run`: it was I/O in
+  workflow code, and Temporal runs deferred calls when it evicts a cached
+  workflow, which closed live sessions. Idle sessions are reaped after 10
+  minutes instead.
+- Each call binds the session's connection to its own deadline, so a hung page
+  can't block past the activity timeout.
+- Added `browser_select`, `browser_scroll`, `browser_back`, `browser_wait`,
+  `browser_screenshot`; typing uses CDP `Input.insertText`, keys use CDP key
+  events; actions report where the page ended up.
+
 # Delivery Steps
 
 ### ✓ Step 1: Create session management and browser_open tool

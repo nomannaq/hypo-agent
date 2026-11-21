@@ -96,6 +96,8 @@ The executor resolves tool calls from a registry with effect types, idempotency 
 
 - 2a ✓ `internal/tool` registry (implements `executor.Tools`) and the first read-only tools: `web_search` (SearXNG, compose) and `browse` (Obscura headless browser over CDP, compose; page → Markdown, private addresses refused). Live smoke tests; worker-loss mid-browse resumes without repeating the model call.
 - 2b ✓ `tool.Effect` (Read/Write); approvals via `kernel.Ctx.Await` in the executor (new `waiting` status, `approval_requested`/`approval_decided` events, `POST /api/runs/{id}/approvals`, beUI approval card); idempotency ledger (`tool_ledger`, `Runner.Ledger`); first write tool `submit_form` plus `inspect_forms`. Approval lives in the executor, not `internal/runtime`: it is part of the agent loop.
+- 2c ✓ Harness tool extension (modelled on go-bot's harness/tools, for a browser-native agent): per-run browser session (`browser_open/_snapshot/_click/_type/_select/_press/_scroll/_back/_wait/_screenshot`; run ID from the executor, not the model; per-call deadlines; idle reaping), `todo_write`, `ask_user` (durable question via the approval pause), `research` (parallel subagents as child runs), per-run tool budgets, screenshot artifacts. `inspect_forms`/`submit_form` were replaced by the session tools; browser actions run without approval by choice.
+- Later from go-bot: `memory` and `session_search` (Step 5), `skill` (Step 6), `schedule` (Step 4), shell/files/jobs (needs the sandbox runner), image reading once the model takes images.
 - Later: sandbox runner using `sandbox/images`; interactive browsing (click, type) on Obscura.
 
 ### ✓ Step 3: Stream runs to the chat UI

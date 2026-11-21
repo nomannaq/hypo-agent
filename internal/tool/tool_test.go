@@ -87,3 +87,19 @@ func TestBrowseRejectsNonWebURLs(t *testing.T) {
 		}
 	}
 }
+
+// Browser session tools never trust a model-supplied run: without one from
+// the executor they refuse, and with one but no open page they say so.
+func TestBrowserSessionNeedsARunAndAPage(t *testing.T) {
+	if _, err := BrowserSnapshot().Run(t.Context(), json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "inside a run") {
+		t.Errorf("no run: err = %v", err)
+	}
+	ctx := WithCall(t.Context(), "r-none", "r-none/tool/0/c1")
+	if _, err := BrowserClick().Run(ctx, json.RawMessage(`{"element_index":0}`)); err == nil || !strings.Contains(err.Error(), "browser_open first") {
+		t.Errorf("no page: err = %v", err)
+	}
+	// A run_id in the arguments is ignored, not used to find a session.
+	if _, err := BrowserSnapshot().Run(t.Context(), json.RawMessage(`{"run_id":"someone-else"}`)); err == nil || !strings.Contains(err.Error(), "inside a run") {
+		t.Errorf("model-supplied run_id: err = %v", err)
+	}
+}

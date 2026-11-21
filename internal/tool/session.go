@@ -1,463 +1,535 @@
 package tool
 
 import (
+	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Session-based browser tools keep a browser page open across multiple tool
-// calls within a single run. Each run gets its own browser session, isolated
-// from other runs. If the worker crashes and loses the session, the next tool
-// call detects it and returns an error telling the model to call browser_open
-// again.
+// The browser_* tools keep one page open per run across tool calls, so the
+// agent can work through a site like a person: open, look, click, type,
+// scroll, go back. The run comes from the call's context (WithCall), never
+// from the model.
+//
+// A session lives in this worker's memory. After a worker restart, or if the
+// activity lands on another worker, it is gone: the tools say so and the model
+// opens the page again (the journal can't restore a browser).
+//
+// ponytail: sessions are per worker process; with several workers, pin a run's
+// browser activities to one worker (a per-worker task queue) or keep sessions
+// in Obscura by target ID and reattach.
 
-var sessionStore sync.Map // map[string]*browserSession
+const (
+	sessionIdleTTL  = 10 * time.Minute // closed after this long unused
+	snapshotContent = 8 << 10          // bytes of page Markdown in a snapshot
+)
 
 type browserSession struct {
-	cdp     *cdp
-	ctxID   string
-	session string
+	*page
+	mu       sync.Mutex // one call at a time: a CDP connection is single-reader
+	lastUsed time.Time
 }
 
-func (bs *browserSession) eval(expr string, out any) error {
-	var res struct {
-		Result struct {
-			Value json.RawMessage `json:"value"`
-		} `json:"result"`
-		Exception *struct {
-			Text      string `json:"text"`
-			Exception struct {
-				Description string `json:"description"`
-			} `json:"exception"`
-		} `json:"exceptionDetails"`
-	}
-	if err := bs.cdp.call(bs.session, "Runtime.evaluate", map[string]any{
-		"expression": expr, "returnByValue": true, "awaitPromise": true,
-	}, &res); err != nil {
-		return err
-	}
-	if res.Exception != nil {
-		msg := res.Exception.Exception.Description
-		if msg == "" {
-			msg = res.Exception.Text
-		}
-		return fmt.Errorf("page script failed: %s", msg)
-	}
-	if out == nil || len(res.Result.Value) == 0 {
-		return nil
-	}
-	return json.Unmarshal(res.Result.Value, out)
-}
+var sessions = struct {
+	sync.Mutex
+	m    map[string]*browserSession
+	reap sync.Once
+}{m: map[string]*browserSession{}}
 
-func (bs *browserSession) markdown() (string, error) {
-	var meta struct{ Title, URL string }
-	if err := bs.eval(`({Title: document.title, URL: location.href})`, &meta); err != nil {
-		return "", err
+// useSession locks the run's session and binds it to this call's context.
+func useSession(ctx context.Context) (*browserSession, func(), error) {
+	runID := RunID(ctx)
+	if runID == "" {
+		return nil, nil, errors.New("browser tools only work inside a run")
 	}
-	var md struct {
-		Markdown string `json:"markdown"`
+	sessions.Lock()
+	bs := sessions.m[runID]
+	sessions.Unlock()
+	if bs == nil {
+		return nil, nil, errors.New("no page is open in this run; call browser_open first")
 	}
-	if err := bs.cdp.call(bs.session, "LP.getMarkdown", nil, &md); err != nil {
-		return "", err
+	bs.mu.Lock()
+	bs.c.bind(ctx)
+	release := func() {
+		bs.lastUsed = time.Now()
+		bs.c.unbind()
+		bs.mu.Unlock()
 	}
-	return fmt.Sprintf("# %s\n%s\n\n%s", meta.Title, meta.URL, strings.TrimSpace(md.Markdown)), nil
-}
-
-func (bs *browserSession) close() {
-	if bs.ctxID != "" {
-		_ = bs.cdp.call("", "Target.disposeBrowserContext", map[string]any{"browserContextId": bs.ctxID}, nil)
-	}
-	bs.cdp.close()
-}
-
-func getOrCreateSession(ctx context.Context, runID, cdpURL, token string) (*browserSession, error) {
-	if val, ok := sessionStore.Load(runID); ok {
-		return val.(*browserSession), nil
-	}
-	bs, err := createSession(ctx, cdpURL, token)
-	if err != nil {
-		return nil, err
-	}
-	sessionStore.Store(runID, bs)
-	return bs, nil
-}
-
-func createSession(ctx context.Context, cdpURL, token string) (*browserSession, error) {
-	// Use a background context for the CDP connection so it persists across
-	// tool calls. The tool's context is only for this call's timeout; the
-	// session lives until the run ends or is explicitly closed.
-	c, err := dialCDP(context.Background(), cdpURL, token)
-	if err != nil {
-		return nil, err
-	}
-	bs := &browserSession{cdp: c}
-	ok := false
-	defer func() {
-		if !ok {
-			bs.close()
-		}
-	}()
-	var bc struct {
-		ID string `json:"browserContextId"`
-	}
-	if err := c.call("", "Target.createBrowserContext", nil, &bc); err != nil {
-		return nil, err
-	}
-	bs.ctxID = bc.ID
-	var target struct {
-		ID string `json:"targetId"`
-	}
-	if err := c.call("", "Target.createTarget", map[string]any{"url": "about:blank", "browserContextId": bc.ID}, &target); err != nil {
-		return nil, err
-	}
-	var att struct {
-		Session string `json:"sessionId"`
-	}
-	if err := c.call("", "Target.attachToTarget", map[string]any{"targetId": target.ID, "flatten": true}, &att); err != nil {
-		return nil, err
-	}
-	bs.session = att.Session
-	if err := c.call(bs.session, "Page.enable", nil, nil); err != nil {
-		return nil, err
-	}
-	ok = true
-	return bs, nil
-}
-
-// CloseSession closes and removes the browser session for the given run ID.
-// It is safe to call even if no session exists for that run.
-func CloseSession(runID string) {
-	if val, ok := sessionStore.LoadAndDelete(runID); ok {
-		val.(*browserSession).close()
-	}
-}
-
-// closeSession is the internal wrapper used by browser_open to replace
-// an existing session. It uses the exported CloseSession.
-func closeSession(runID string) {
-	CloseSession(runID)
-}
-
-// lookupSession retrieves the session for a run, or returns a session-error
-// if the session is missing (worker restart, not yet opened). It also checks
-// whether the underlying CDP connection is still alive; if the WebSocket has
-// dropped, it evicts the dead entry and tells the model to call browser_open.
-func lookupSession(runID string) (*browserSession, error) {
-	val, ok := sessionStore.Load(runID)
-	if !ok {
-		return nil, fmt.Errorf("no browser session for this run; call browser_open first")
-	}
-	bs := val.(*browserSession)
-	// Check if the CDP connection is still alive by pinging with a no-op eval.
-	// If it fails, the session is stale (Obscura restarted, WebSocket dropped).
 	if err := bs.eval("1", nil); err != nil {
-		closeSession(runID)
-		return nil, fmt.Errorf("browser session lost; call browser_open to reconnect: %w", err)
+		release()
+		closeSession(runID, bs)
+		return nil, nil, fmt.Errorf("the browser session was lost (%v); call browser_open again", err)
 	}
-	return bs, nil
+	return bs, release, nil
 }
 
-// BrowserSnapshot returns the browser_snapshot tool: current page info plus
-// an indexed list of interactive elements.
+// closeSession closes bs if it is still the run's session.
+func closeSession(runID string, bs *browserSession) {
+	sessions.Lock()
+	if sessions.m[runID] == bs {
+		delete(sessions.m, runID)
+	}
+	sessions.Unlock()
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.close()
+}
+
+// reapIdle closes sessions nobody has used for sessionIdleTTL: runs end
+// without telling the tools, and a session holds a connection and a tab.
+func reapIdle() {
+	for range time.Tick(time.Minute) {
+		sessions.Lock()
+		var idle []string
+		for id, bs := range sessions.m {
+			if bs.mu.TryLock() {
+				if time.Since(bs.lastUsed) > sessionIdleTTL {
+					idle = append(idle, id)
+				}
+				bs.mu.Unlock()
+			}
+		}
+		victims := make([]*browserSession, 0, len(idle))
+		for _, id := range idle {
+			victims = append(victims, sessions.m[id])
+			delete(sessions.m, id)
+		}
+		sessions.Unlock()
+		for _, bs := range victims {
+			bs.mu.Lock()
+			bs.close()
+			bs.mu.Unlock()
+		}
+	}
+}
+
+// act runs an action on the run's page and reports where the page is after
+// it, following any navigation the action started.
+func act(ctx context.Context, fn func(bs *browserSession) (string, error)) (string, error) {
+	bs, release, err := useSession(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	bs.c.forget(bs.session, "Page.frameNavigated", "Page.loadEventFired")
+	done, err := fn(bs)
+	if err != nil {
+		return "", err
+	}
+	bs.settle()
+	return done + "\nNow on: " + bs.where(), nil
+}
+
+// BrowserOpen returns browser_open: it opens a URL in the run's browser
+// session, replacing any page already open.
+func BrowserOpen(cdpURL, token string) Tool {
+	return Typed("browser_open",
+		"Open a web page in this run's browser session (JavaScript runs; the page stays open across calls). Use it to interact with a site: then browser_snapshot to see it, and browser_click, browser_type, browser_select, browser_press, browser_scroll, browser_back, browser_wait to act. Replaces the page already open.",
+		`{"type":"object","properties":{"url":{"type":"string","description":"An http or https URL"}},"required":["url"]}`,
+		func(ctx context.Context, in struct {
+			URL string `json:"url"`
+		}) (string, error) {
+			runID := RunID(ctx)
+			if runID == "" {
+				return "", errors.New("browser tools only work inside a run")
+			}
+			if err := checkURL(in.URL); err != nil {
+				return "", err
+			}
+			sessions.reap.Do(func() { go reapIdle() })
+			p, err := newPage(ctx, cdpURL, token)
+			if err != nil {
+				return "", err
+			}
+			if err := p.navigate(in.URL); err != nil {
+				p.close()
+				return "", err
+			}
+			where := p.where()
+			p.c.unbind()
+			bs := &browserSession{page: p, lastUsed: time.Now()}
+			sessions.Lock()
+			old := sessions.m[runID]
+			sessions.m[runID] = bs
+			sessions.Unlock()
+			if old != nil {
+				go closeSession(runID, old)
+			}
+			return "Opened " + where + ". Call browser_snapshot to see its content and elements.", nil
+		})
+}
+
+// BrowserSnapshot returns browser_snapshot: the page's interactive elements,
+// numbered for the action tools, then its content as Markdown.
 func BrowserSnapshot() Tool {
 	return Typed("browser_snapshot",
-		"Return the current page: title, URL, Markdown content, and an indexed list of interactive elements like [3] button \"Send\". Call this after navigation or after an action to see the updated page.",
-		`{"type":"object","properties":`+
-			`{"run_id":{"type":"string","description":"The run ID for session isolation"}},`+
-			`"required":["run_id"]}`,
-		func(ctx context.Context, in struct {
-			RunID string `json:"run_id"`
-		}) (string, error) {
-			bs, err := lookupSession(in.RunID)
+		"Show the open page: its title and URL, a numbered list of interactive elements like [3] button \"Send\", and the page content as Markdown. Element numbers change when the page changes, so take a new snapshot after acting.",
+		`{"type":"object","properties":{}}`,
+		func(ctx context.Context, _ struct{}) (string, error) {
+			bs, release, err := useSession(ctx)
 			if err != nil {
+				return "", err
+			}
+			defer release()
+			var els []struct {
+				Index                        int
+				Tag, Role, Name, Type, Value string
+			}
+			if err := bs.eval(interactiveElementsJS, &els); err != nil {
 				return "", err
 			}
 			md, err := bs.markdown()
 			if err != nil {
 				return "", err
 			}
-			var elements []struct {
-				Tag   string `json:"tag"`
-				Name  string `json:"name"`
-				Role  string `json:"role"`
-				Type  string `json:"type"`
-				Value string `json:"value"`
-				Index int    `json:"index"`
-			}
-			if err := bs.eval(interactiveElementsJS, &elements); err != nil {
-				return "", err
-			}
-			var sb strings.Builder
-			sb.WriteString(md)
-			if len(elements) == 0 {
-				sb.WriteString("\n\nNo interactive elements on this page.")
-				return sb.String(), nil
-			}
-			sb.WriteString("\n\nInteractive elements:\n")
-			for _, el := range elements {
-				role := el.Role
-				if role == "" {
-					role = el.Tag
+			title, content, _ := strings.Cut(md, "\n\n")
+			var b strings.Builder
+			b.WriteString(title)
+			if len(els) == 0 {
+				b.WriteString("\n\nNo interactive elements.")
+			} else {
+				b.WriteString("\n\nInteractive elements:\n")
+				for _, el := range els {
+					fmt.Fprintf(&b, "[%d] %s", el.Index, cmp.Or(el.Role, el.Tag))
+					if el.Name != "" {
+						fmt.Fprintf(&b, " %q", el.Name)
+					}
+					if el.Type != "" && el.Tag == "input" {
+						fmt.Fprintf(&b, " (%s)", el.Type)
+					}
+					if el.Value != "" {
+						fmt.Fprintf(&b, " value=%q", el.Value)
+					}
+					b.WriteString("\n")
 				}
-				fmt.Fprintf(&sb, "[%d] %s", el.Index, role)
-				if el.Name != "" {
-					fmt.Fprintf(&sb, " %q", el.Name)
-				}
-				if el.Type != "" && el.Tag == "input" {
-					fmt.Fprintf(&sb, " (type: %s)", el.Type)
-				}
-				// Show the current value for input/textarea/select so the agent
-				// can verify what it typed, since Markdown from LP.getMarkdown
-				// only shows placeholder text.
-				if el.Value != "" && (el.Tag == "input" || el.Tag == "textarea" || el.Tag == "select") {
-					fmt.Fprintf(&sb, " value: %q", el.Value)
-				}
-				sb.WriteString("\n")
 			}
-			return strings.TrimRight(sb.String(), "\n"), nil
+			if len(content) > snapshotContent {
+				content = content[:snapshotContent] + "\n…[page content truncated; scroll or use browse for the full page]"
+			}
+			b.WriteString("\nPage content:\n" + content)
+			return b.String(), nil
 		})
 }
 
-// interactiveElementsJS collects all interactive elements and marks them with
-// a data attribute so click/type can find them by index.
+// interactiveElementsJS numbers the page's visible interactive elements and
+// tags each with data-hypo-idx so the action tools can find it again.
 const interactiveElementsJS = `(() => {
-  const roles = ['button', 'a', 'input', 'textarea', 'select', 'form'];
-  const els = Array.from(document.querySelectorAll(roles.join(',') + ', [role="button"], [role="link"]'));
-  const result = [];
-  let idx = 0;
-  for (const el of els) {
-    // Use getBoundingClientRect and getComputedStyle instead of offsetParent
-    // so fixed-position elements (modals, navbars, FABs) are not skipped.
+  document.querySelectorAll('[data-hypo-idx]').forEach(el => el.removeAttribute('data-hypo-idx'));
+  const sel = 'a[href], button, input:not([type=hidden]), textarea, select, summary, [role=button], [role=link], [role=tab], [role=menuitem], [role=checkbox], [contenteditable=true]';
+  const out = [];
+  for (const el of document.querySelectorAll(sel)) {
     const style = getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden') continue;
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
     const tag = el.tagName.toLowerCase();
-    const role = el.getAttribute('role') || '';
-    const name = el.textContent?.trim().slice(0, 80)
-      || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name || '';
-    // Capture the current value for form fields so the snapshot reflects what
-    // was typed, not just placeholder text.
+    const label = el.labels && el.labels.length ? el.labels[0].textContent : '';
+    const name = (el.getAttribute('aria-label') || label || (tag === 'select' ? '' : el.textContent) ||
+      el.getAttribute('placeholder') || el.getAttribute('title') || el.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
     let value = '';
-    if (tag === 'input' || tag === 'textarea') {
-      value = el.value || '';
-    } else if (tag === 'select') {
-      const opt = el.options[el.selectedIndex];
-      value = opt ? opt.text : '';
-    }
-    el.setAttribute('data-hypo-idx', String(idx));
-    result.push({ tag, name, role, type: el.type || '', value, index: idx });
-    idx++;
+    if (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) value = el.checked ? 'checked' : '';
+    else if (tag === 'input' || tag === 'textarea') value = el.type === 'password' && el.value ? '••••' : el.value;
+    else if (tag === 'select') value = el.selectedOptions.length ? el.selectedOptions[0].text : '';
+    el.setAttribute('data-hypo-idx', String(out.length));
+    out.push({Index: out.length, Tag: tag, Role: el.getAttribute('role') || '', Name: name, Type: el.type || '', Value: (value || '').slice(0, 80)});
   }
-  return result;
+  return out;
 })()`
 
-// BrowserClick returns the browser_click tool: clicks an element by its
-// indexed position (from the last snapshot).
-func BrowserClick() Tool {
-	t := Typed("browser_click",
-		"Click the element at the given index (from the last snapshot). This can trigger navigation, form submission, or JavaScript actions.",
-		`{"type":"object","properties":`+
-			`{"run_id":{"type":"string","description":"The run ID for session isolation"},`+
-			`"element_index":{"type":"integer","minimum":0,"description":"Element index from the last snapshot"}},`+
-			`"required":["run_id","element_index"]}`,
-		func(ctx context.Context, in struct {
-			RunID        string `json:"run_id"`
-			ElementIndex int    `json:"element_index"`
-		}) (string, error) {
-			bs, err := lookupSession(in.RunID)
-			if err != nil {
-				return "", err
-			}
-			var result struct {
-				Found bool   `json:"found"`
-				Role  string `json:"role"`
-				Name  string `json:"name"`
-			}
-			if err := bs.eval(fmt.Sprintf("(%s)(%d)", clickJS, in.ElementIndex), &result); err != nil {
-				return "", err
-			}
-			if !result.Found {
-				return "", fmt.Errorf("element %d not found; call browser_snapshot for fresh indices", in.ElementIndex)
-			}
-			return fmt.Sprintf("Clicked element %d (%s %q)", in.ElementIndex, result.Role, result.Name), nil
-		})
-	t.Effect = Read
-	return t
+// element finds a numbered element and scrolls it into view; the JS returns
+// null when the number is stale.
+const findElementJS = `(idx) => {
+  const el = document.querySelector('[data-hypo-idx="' + idx + '"]');
+  if (el) el.scrollIntoView({block: 'center'});
+  return el;
+}`
+
+func staleElement(i int) error {
+	return fmt.Errorf("element %d is not on the page any more; take a new browser_snapshot", i)
 }
 
-// clickJS finds the element by data-hypo-idx, scrolls it into view, clicks
-// it, and reports back. Scrolling ensures fixed-position and off-screen
-// elements are visible before interaction.
-const clickJS = `(function(idx) {
-  const el = document.querySelector('[data-hypo-idx="' + idx + '"]');
-  if (!el) return { found: false };
-  el.scrollIntoView({ block: 'center', inline: 'nearest' });
-  const role = el.getAttribute('role') || el.tagName.toLowerCase();
-  const name = el.textContent?.trim().slice(0, 80) || el.getAttribute('aria-label') || '';
-  el.click();
-  return { found: true, role, name };
-})`
-
-// BrowserType returns the browser_type tool: types text into an element by
-// its indexed position.
-func BrowserType() Tool {
-	t := Typed("browser_type",
-		"Type text into the element at the given index (from the last snapshot). Use for inputs, textareas, and search fields.",
-		`{"type":"object","properties":`+
-			`{"run_id":{"type":"string","description":"The run ID for session isolation"},`+
-			`"element_index":{"type":"integer","minimum":0,"description":"Element index from the last snapshot"},`+
-			`"text":{"type":"string","description":"Text to type into the element"}},`+
-			`"required":["run_id","element_index","text"]}`,
+// BrowserClick returns browser_click.
+func BrowserClick() Tool {
+	return Typed("browser_click",
+		"Click a numbered element from the last browser_snapshot (a link, button, checkbox, tab...). It can navigate, submit a form, or change the page.",
+		`{"type":"object","properties":{"element_index":{"type":"integer","minimum":0}},"required":["element_index"]}`,
 		func(ctx context.Context, in struct {
-			RunID        string `json:"run_id"`
+			ElementIndex int `json:"element_index"`
+		}) (string, error) {
+			return act(ctx, func(bs *browserSession) (string, error) {
+				var res struct {
+					Found bool
+					Name  string
+				}
+				if err := bs.eval(fmt.Sprintf(`((find) => {
+  const el = find(%d);
+  if (!el) return {Found: false};
+  const name = (el.getAttribute('aria-label') || el.textContent || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  el.click();
+  return {Found: true, Name: name};
+})(%s)`, in.ElementIndex, findElementJS), &res); err != nil {
+					return "", err
+				}
+				if !res.Found {
+					return "", staleElement(in.ElementIndex)
+				}
+				return fmt.Sprintf("Clicked [%d] %q.", in.ElementIndex, res.Name), nil
+			})
+		})
+}
+
+// BrowserType returns browser_type: it replaces a field's text by typing, so
+// frameworks see real input events.
+func BrowserType() Tool {
+	return Typed("browser_type",
+		"Type into a numbered input or textarea from the last browser_snapshot, replacing its text. Set submit to press Enter afterwards (e.g. to run a search).",
+		`{"type":"object","properties":{"element_index":{"type":"integer","minimum":0},"text":{"type":"string"},"submit":{"type":"boolean","description":"Press Enter after typing"}},"required":["element_index","text"]}`,
+		func(ctx context.Context, in struct {
 			ElementIndex int    `json:"element_index"`
 			Text         string `json:"text"`
+			Submit       bool   `json:"submit"`
 		}) (string, error) {
-			bs, err := lookupSession(in.RunID)
-			if err != nil {
-				return "", err
-			}
-			var result struct {
-				Found bool   `json:"found"`
-				Tag   string `json:"tag"`
-			}
-			// JSON-encode the text so special characters (backslashes, newlines,
-			// quotes) don't break the JavaScript expression.
-			textJSON, err := json.Marshal(in.Text)
-			if err != nil {
-				return "", err
-			}
-			if err := bs.eval(fmt.Sprintf("(%s)(%d, %s)", typeJS, in.ElementIndex, textJSON), &result); err != nil {
-				return "", err
-			}
-			if !result.Found {
-				return "", fmt.Errorf("element %d not found; call browser_snapshot for fresh indices", in.ElementIndex)
-			}
-			return fmt.Sprintf("Typed into element %d (%s)", in.ElementIndex, result.Tag), nil
-		})
-	t.Effect = Read
-	return t
-}
-
-// typeJS finds the element by data-hypo-idx, scrolls it into view, sets its
-// value using the native property descriptor (so React/Vue controlled inputs
-// register the change), and fires input/change events.
-const typeJS = `(function(idx, text) {
-  const el = document.querySelector('[data-hypo-idx="' + idx + '"]');
-  if (!el) return { found: false };
-  const tag = el.tagName.toLowerCase();
-  el.scrollIntoView({ block: 'center', inline: 'nearest' });
+			return act(ctx, func(bs *browserSession) (string, error) {
+				var found bool
+				if err := bs.eval(fmt.Sprintf(`((find) => {
+  const el = find(%d);
+  if (!el) return false;
   el.focus();
-  // Use the native value setter descriptor so React/Vue controlled inputs
-  // register the change. Plain assignment bypasses framework tracking.
-  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-    window.HTMLInputElement.prototype, 'value'
-  ).set;
-  if (tag === 'input' && nativeInputValueSetter) {
-    nativeInputValueSetter.call(el, text);
-  } else {
-    el.value = text;
-  }
-  if (el.dispatchEvent) {
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-  return { found: true, tag };
-})`
-
-// BrowserPress returns the browser_press tool: presses a keyboard key.
-func BrowserPress() Tool {
-	t := Typed("browser_press",
-		"Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.).",
-		`{"type":"object","properties":`+
-			`{"run_id":{"type":"string","description":"The run ID for session isolation"},`+
-			`"key":{"type":"string","description":"Key name (Enter, Tab, Escape, ArrowDown, etc.)"}},`+
-			`"required":["run_id","key"]}`,
-		func(ctx context.Context, in struct {
-			RunID string `json:"run_id"`
-			Key   string `json:"key"`
-		}) (string, error) {
-			bs, err := lookupSession(in.RunID)
-			if err != nil {
-				return "", err
-			}
-			// JSON-encode the key so special characters don't break the JavaScript.
-			keyJSON, err := json.Marshal(in.Key)
-			if err != nil {
-				return "", err
-			}
-			if err := bs.eval(fmt.Sprintf("(%s)%s", pressJS, keyJSON), nil); err != nil {
-				return "", err
-			}
-			return fmt.Sprintf("Pressed key: %s", in.Key), nil
+  if ('value' in el) { el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); }
+  else if (el.isContentEditable) el.textContent = '';
+  return true;
+})(%s)`, in.ElementIndex, findElementJS), &found); err != nil {
+					return "", err
+				}
+				if !found {
+					return "", staleElement(in.ElementIndex)
+				}
+				if err := bs.c.call(bs.session, "Input.insertText", map[string]any{"text": in.Text}, nil); err != nil {
+					return "", err
+				}
+				_ = bs.eval(`document.activeElement && document.activeElement.dispatchEvent(new Event('change', {bubbles: true}))`, nil)
+				if in.Submit {
+					if err := pressKey(bs, "Enter"); err != nil {
+						return "", err
+					}
+					return fmt.Sprintf("Typed into [%d] and pressed Enter.", in.ElementIndex), nil
+				}
+				return fmt.Sprintf("Typed into [%d].", in.ElementIndex), nil
+			})
 		})
-	t.Effect = Read
-	return t
 }
 
-// pressJS dispatches a keydown/keyup for the given key name.
-const pressJS = `(function(key) {
-  const target = document.activeElement || document.body;
-  target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-  target.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
-})`
-
-// BrowserOpen returns the browser_open tool: opens a URL in a persistent
-// browser session for the given run.
-func BrowserOpen(cdpURL, token string) Tool {
-	return Typed("browser_open",
-		"Open a web page in a persistent browser session. Use this first, then act on the page with other browser tools.",
-		`{"type":"object","properties":`+
-			`{"run_id":{"type":"string","description":"The run ID for session isolation"},`+
-			`"url":{"type":"string","description":"An http or https URL"}},`+
-			`"required":["run_id","url"]}`,
+// BrowserSelect returns browser_select.
+func BrowserSelect() Tool {
+	return Typed("browser_select",
+		"Choose an option in a numbered dropdown (select) from the last browser_snapshot, by its visible text or value.",
+		`{"type":"object","properties":{"element_index":{"type":"integer","minimum":0},"option":{"type":"string"}},"required":["element_index","option"]}`,
 		func(ctx context.Context, in struct {
-			RunID string `json:"run_id"`
-			URL   string `json:"url"`
+			ElementIndex int    `json:"element_index"`
+			Option       string `json:"option"`
 		}) (string, error) {
-			u, err := url.Parse(in.URL)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				return "", fmt.Errorf("needs an http or https URL, got %q", in.URL)
+			return act(ctx, func(bs *browserSession) (string, error) {
+				opt, _ := json.Marshal(in.Option)
+				var res struct {
+					Found   bool
+					Chosen  string
+					Options []string
+				}
+				if err := bs.eval(fmt.Sprintf(`((find, want) => {
+  const el = find(%d);
+  if (!el || el.tagName !== 'SELECT') return {Found: false};
+  const norm = s => s.replace(/\s+/g, ' ').trim().toLowerCase();
+  const o = Array.from(el.options).find(o => o.value === want || norm(o.text) === norm(want));
+  if (!o) return {Found: true, Options: Array.from(el.options).map(o => o.text.trim()).slice(0, 30)};
+  el.value = o.value;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return {Found: true, Chosen: o.text.trim()};
+})(%s, %s)`, in.ElementIndex, findElementJS, opt), &res); err != nil {
+					return "", err
+				}
+				switch {
+				case !res.Found:
+					return "", fmt.Errorf("element %d is not a dropdown on this page; take a new browser_snapshot", in.ElementIndex)
+				case res.Chosen == "":
+					return "", fmt.Errorf("no option %q; the options are: %s", in.Option, strings.Join(res.Options, " | "))
+				}
+				return fmt.Sprintf("Selected %q in [%d].", res.Chosen, in.ElementIndex), nil
+			})
+		})
+}
+
+// keyCodes are the keys browser_press accepts, with their Windows virtual key
+// codes (CDP needs them for keys to have their default effect, like Enter
+// submitting a form).
+var keyCodes = map[string]int{
+	"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "Delete": 46, "Space": 32,
+	"ArrowUp": 38, "ArrowDown": 40, "ArrowLeft": 37, "ArrowRight": 39,
+	"PageUp": 33, "PageDown": 34, "Home": 36, "End": 35,
+}
+
+func pressKey(bs *browserSession, key string) error {
+	code, ok := keyCodes[key]
+	if !ok {
+		names := make([]string, 0, len(keyCodes))
+		for k := range keyCodes {
+			names = append(names, k)
+		}
+		return fmt.Errorf("unsupported key %q; use one of %s", key, strings.Join(names, ", "))
+	}
+	down := map[string]any{"type": "keyDown", "key": key, "code": key, "windowsVirtualKeyCode": code}
+	switch key {
+	case "Enter":
+		down["text"] = "\r"
+	case "Space":
+		down["key"], down["text"] = " ", " "
+	}
+	if err := bs.c.call(bs.session, "Input.dispatchKeyEvent", down, nil); err != nil {
+		return err
+	}
+	return bs.c.call(bs.session, "Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": down["key"], "code": key, "windowsVirtualKeyCode": code}, nil)
+}
+
+// BrowserPress returns browser_press.
+func BrowserPress() Tool {
+	return Typed("browser_press",
+		"Press a key on the focused element: Enter, Tab, Escape, Backspace, Delete, Space, ArrowUp/Down/Left/Right, PageUp, PageDown, Home, End.",
+		`{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}`,
+		func(ctx context.Context, in struct {
+			Key string `json:"key"`
+		}) (string, error) {
+			return act(ctx, func(bs *browserSession) (string, error) {
+				if err := pressKey(bs, in.Key); err != nil {
+					return "", err
+				}
+				return "Pressed " + in.Key + ".", nil
+			})
+		})
+}
+
+// BrowserScroll returns browser_scroll.
+func BrowserScroll() Tool {
+	return Typed("browser_scroll",
+		"Scroll the open page: down or up by most of a screen, or to the top or bottom. Pages that load more content on scroll show it in the next snapshot.",
+		`{"type":"object","properties":{"direction":{"type":"string","enum":["down","up","top","bottom"]}},"required":["direction"]}`,
+		func(ctx context.Context, in struct {
+			Direction string `json:"direction"`
+		}) (string, error) {
+			moves := map[string]string{
+				"down": "window.scrollBy(0, innerHeight * 0.8)", "up": "window.scrollBy(0, -innerHeight * 0.8)",
+				"top": "window.scrollTo(0, 0)", "bottom": "window.scrollTo(0, document.documentElement.scrollHeight)",
 			}
-			// Close existing session for this run, if any, and create a new one.
-			closeSession(in.RunID)
-			bs, err := createSession(ctx, cdpURL, token)
+			move, ok := moves[in.Direction]
+			if !ok {
+				return "", fmt.Errorf("direction must be down, up, top or bottom, got %q", in.Direction)
+			}
+			return act(ctx, func(bs *browserSession) (string, error) {
+				var pos struct{ Y, Height int }
+				if err := bs.eval(`(async () => { `+move+`; await new Promise(r => setTimeout(r, 300));
+  return {Y: Math.round(scrollY + innerHeight), Height: document.documentElement.scrollHeight}; })()`, &pos); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("Scrolled %s: showing up to %dpx of %dpx.", in.Direction, pos.Y, pos.Height), nil
+			})
+		})
+}
+
+// BrowserBack returns browser_back.
+func BrowserBack() Tool {
+	return Typed("browser_back",
+		"Go back to the previous page in this run's browser session.",
+		`{"type":"object","properties":{}}`,
+		func(ctx context.Context, _ struct{}) (string, error) {
+			return act(ctx, func(bs *browserSession) (string, error) {
+				var had bool
+				if err := bs.eval(`history.length > 1 ? (history.back(), true) : false`, &had); err != nil {
+					return "", err
+				}
+				if !had {
+					return "", errors.New("there is no previous page")
+				}
+				return "Went back.", nil
+			})
+		})
+}
+
+// BrowserWait returns browser_wait: it waits for text to appear, for pages
+// that fill in after loading.
+func BrowserWait() Tool {
+	return Typed("browser_wait",
+		"Wait until some text appears on the open page (up to 20 seconds), for content that loads after the page does.",
+		`{"type":"object","properties":{"text":{"type":"string"},"seconds":{"type":"integer","minimum":1,"maximum":20,"description":"How long to wait (default 10)"}},"required":["text"]}`,
+		func(ctx context.Context, in struct {
+			Text    string `json:"text"`
+			Seconds int    `json:"seconds"`
+		}) (string, error) {
+			secs := min(cmp.Or(max(in.Seconds, 0), 10), 20)
+			text, _ := json.Marshal(in.Text)
+			bs, release, err := useSession(ctx)
 			if err != nil {
 				return "", err
 			}
-			ok := false
-			defer func() {
-				if !ok {
-					bs.close()
-				}
-			}()
-			var nav struct {
-				ErrorText string `json:"errorText"`
-			}
-			if err := bs.cdp.call(bs.session, "Page.navigate", map[string]any{"url": u.String()}, &nav); err != nil {
+			defer release()
+			var found bool
+			if err := bs.eval(fmt.Sprintf(`new Promise(resolve => {
+  const want = %s, until = Date.now() + %d;
+  (function poll() {
+    if (document.body && document.body.innerText.includes(want)) return resolve(true);
+    if (Date.now() > until) return resolve(false);
+    setTimeout(poll, 250);
+  })();
+})`, text, secs*1000), &found); err != nil {
 				return "", err
 			}
-			if nav.ErrorText != "" {
-				return "", fmt.Errorf("loading %s: %s", u, nav.ErrorText)
+			if !found {
+				return fmt.Sprintf("%q did not appear within %ds.", in.Text, secs), nil
 			}
-			// Use a bounded wait so SPA pages or fast cached loads don't hang
-			// the entire run. If the load event doesn't fire within 30 seconds,
-			// the page is likely still usable (client-side routing) or stuck.
-			if !bs.cdp.waitEventFor(bs.session, "Page.loadEventFired", 30*time.Second) {
-				// Page may still be usable (SPA) — don't fail, just continue.
-			}
-			sessionStore.Store(in.RunID, bs)
-			ok = true
-			var meta struct{ Title, URL string }
-			if err := bs.eval(`({Title: document.title, URL: location.href})`, &meta); err != nil {
+			return fmt.Sprintf("%q is on the page.", in.Text), nil
+		})
+}
+
+// SaveArtifact stores a file a tool produced for the user (a screenshot) and
+// returns its ID. key is the call's idempotency key, so a retried call
+// replaces rather than duplicates.
+type SaveArtifact func(ctx context.Context, runID, key, mime string, data []byte) (id string, err error)
+
+// BrowserScreenshot returns browser_screenshot: a PNG of the open page,
+// stored as an artifact the chat shows the user. The model gets its ID, not
+// the image.
+func BrowserScreenshot(save SaveArtifact) Tool {
+	return Typed("browser_screenshot",
+		"Take a screenshot of the open page and show it to the user in the chat (you don't see the image). Use it when the user would want to see the page, or as evidence of what was on screen.",
+		`{"type":"object","properties":{"full_page":{"type":"boolean","description":"Capture the whole page, not just the visible part"}}}`,
+		func(ctx context.Context, in struct {
+			FullPage bool `json:"full_page"`
+		}) (string, error) {
+			bs, release, err := useSession(ctx)
+			if err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("Opened %s: %s", meta.URL, meta.Title), nil
+			defer release()
+			var shot struct {
+				Data string `json:"data"`
+			}
+			if err := bs.c.call(bs.session, "Page.captureScreenshot", map[string]any{
+				"format": "png", "captureBeyondViewport": in.FullPage,
+			}, &shot); err != nil {
+				return "", err
+			}
+			png, err := base64.StdEncoding.DecodeString(shot.Data)
+			if err != nil {
+				return "", fmt.Errorf("screenshot: %w", err)
+			}
+			id, err := save(ctx, RunID(ctx), CallKey(ctx), "image/png", png)
+			if err != nil {
+				return "", fmt.Errorf("saving the screenshot: %w", err)
+			}
+			return fmt.Sprintf("Screenshot of %s shown to the user. [artifact:%s]", bs.where(), id), nil
 		})
 }

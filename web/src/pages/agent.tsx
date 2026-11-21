@@ -18,6 +18,8 @@ import {
     ToolApproval,
     type ToolApprovalStatus,
 } from '@/components/agents/tool-approval';
+import { TodoList, type TodoItem } from '@/components/agents/todo-list';
+import { QuestionCard } from '@/components/question-card';
 import { GlowFrame } from '@/components/agents/glow-frame';
 import { MessageScroller } from '@/components/agents/message-scroller';
 import { PromptInput } from '@/components/agents/prompt-input';
@@ -35,19 +37,48 @@ const host = (url: string) => {
     }
 };
 
-// A step label for a tool call, from its arguments when we know the tool.
+// A step label for a tool call, from its arguments when we know the tool:
+// [while running, once done].
 const toolLabel = (call: ToolCall, done: boolean) => {
-    const args = (call.args ?? {}) as { query?: unknown; url?: unknown };
-    const url = typeof args.url === 'string' ? host(args.url) : undefined;
-    if (call.name === 'web_search' && typeof args.query === 'string')
-        return `${done ? 'Searched' : 'Searching'} “${args.query}”`;
-    if (call.name === 'browse' && url)
-        return `${done ? 'Read' : 'Reading'} ${url}`;
-    if (call.name === 'inspect_forms' && url)
-        return `${done ? 'Looked at the forms on' : 'Looking at the forms on'} ${url}`;
-    if (call.name === 'submit_form' && url)
-        return `${done ? 'Submitted a form on' : 'Submitting a form on'} ${url}`;
-    return `${done ? 'Ran' : 'Running'} ${call.name}`;
+    const a = (call.args ?? {}) as {
+        query?: string;
+        url?: string;
+        element_index?: number;
+        text?: string;
+        option?: string;
+        key?: string;
+        direction?: string;
+        tasks?: { title?: string }[];
+    };
+    const el = `element ${a.element_index ?? '?'}`;
+    const labels: Record<string, [string, string]> = {
+        web_search: [`Searching “${a.query}”`, `Searched “${a.query}”`],
+        browse: [`Reading ${host(a.url ?? '')}`, `Read ${host(a.url ?? '')}`],
+        browser_open: [
+            `Opening ${host(a.url ?? '')}`,
+            `Opened ${host(a.url ?? '')}`,
+        ],
+        browser_snapshot: ['Looking at the page', 'Looked at the page'],
+        browser_click: [`Clicking ${el}`, `Clicked ${el}`],
+        browser_type: [`Typing “${a.text}”`, `Typed “${a.text}”`],
+        browser_select: [`Choosing “${a.option}”`, `Chose “${a.option}”`],
+        browser_press: [`Pressing ${a.key}`, `Pressed ${a.key}`],
+        browser_scroll: [`Scrolling ${a.direction}`, `Scrolled ${a.direction}`],
+        browser_back: ['Going back', 'Went back'],
+        browser_wait: [`Waiting for “${a.text}”`, `Waited for “${a.text}”`],
+        browser_screenshot: ['Taking a screenshot', 'Took a screenshot'],
+        todo_write: ['Updating the plan', 'Updated the plan'],
+        ask_user: ['Asking you', 'Asked you'],
+        research: [
+            `Researching ${a.tasks?.length ?? ''} topics in parallel`,
+            `Researched ${(a.tasks ?? []).map((t) => t.title).join(', ')}`,
+        ],
+    };
+    const [running, finished] = labels[call.name] ?? [
+        `Running ${call.name}`,
+        `Ran ${call.name}`,
+    ];
+    return done ? finished : running;
 };
 
 // One agent.Event from the run's stream (internal/agent/events.go).
@@ -114,10 +145,15 @@ const startRun = async (
     return ((await res.json()) as { id: string }).id;
 };
 
-// The run's approval requests, each with the call it's about and where it
-// stands (ToolApproval's statuses).
-type ApprovalItem = { call: ToolCall; status: ToolApprovalStatus };
-const approvals = (events: AgentEvent[]): ApprovalItem[] => {
+// The run's requests to the user (approval_requested): Write calls to
+// approve, and ask_user questions. Each comes with its call, the user's
+// decision once made, and the call's result once it has one.
+type UserRequest = {
+    call: ToolCall;
+    decided?: AgentEvent;
+    result?: AgentEvent;
+};
+const userRequests = (events: AgentEvent[]): UserRequest[] => {
     const calls = new Map<string, ToolCall>();
     for (const e of events)
         for (const c of e.tool_calls ?? []) calls.set(c.id, c);
@@ -127,20 +163,54 @@ const approvals = (events: AgentEvent[]): ApprovalItem[] => {
         .filter((e) => e.kind === 'approval_requested' && e.call_id)
         .map((e) => {
             const call = calls.get(e.call_id!) ?? { id: e.call_id!, name: '?' };
-            const decided = find('approval_decided', call.id);
-            const result = find('tool_result', call.id);
-            const status: ToolApprovalStatus = !decided
-                ? 'pending'
-                : !decided.approved
-                  ? 'denied'
-                  : !result
-                    ? 'running'
-                    : result.is_error
-                      ? 'error'
-                      : 'complete';
-            return { call, status };
+            return {
+                call,
+                decided: find('approval_decided', call.id),
+                result: find('tool_result', call.id),
+            };
         });
 };
+
+const approvalStatus = ({
+    decided,
+    result,
+}: UserRequest): ToolApprovalStatus =>
+    !decided
+        ? 'pending'
+        : !decided.approved
+          ? 'denied'
+          : !result
+            ? 'running'
+            : result.is_error
+              ? 'error'
+              : 'complete';
+
+// The latest plan the agent wrote with todo_write.
+const latestTodos = (events: AgentEvent[]): TodoItem[] => {
+    const calls = events.flatMap((e) =>
+        (e.tool_calls ?? []).filter((c) => c.name === 'todo_write'),
+    );
+    const args = calls.at(-1)?.args as
+        { todos?: { content: string; status: string }[] } | undefined;
+    return (args?.todos ?? []).map((t, i) => ({
+        id: String(i),
+        title: t.content,
+        status:
+            t.status === 'in_progress'
+                ? 'in-progress'
+                : (t.status as TodoItem['status']),
+    }));
+};
+
+// Screenshots the run took: browser_screenshot results carry [artifact:ID].
+const screenshots = (events: AgentEvent[]) =>
+    events.flatMap((e) =>
+        e.kind === 'tool_result' && !e.is_error
+            ? [...(e.text ?? '').matchAll(/\[artifact:([\w-]+)\]/g)].map(
+                  (m) => m[1],
+              )
+            : [],
+    );
 
 // What the user is asked to approve, as ToolApproval parameters: the URL,
 // then each form field.
@@ -193,7 +263,9 @@ const activityItems = (
                 meta: result?.is_error
                     ? 'failed'
                     : asked && !answered
-                      ? 'needs your approval'
+                      ? call.name === 'ask_user'
+                          ? 'waiting for your answer'
+                          : 'needs your approval'
                       : undefined,
             });
         }
@@ -233,10 +305,15 @@ export default function Agent() {
     const waitingForUser = turns.some(
         (t) =>
             t.status === 'working' &&
-            approvals(t.events ?? []).some((a) => a.status === 'pending'),
+            userRequests(t.events ?? []).some((r) => !r.decided),
     );
 
-    const decide = async (runId: string, callId: string, approved: boolean) => {
+    const decide = async (
+        runId: string,
+        callId: string,
+        approved: boolean,
+        answer?: string,
+    ) => {
         const key = `${runId}/${callId}`;
         setDeciding((d) => new Set(d).add(key));
         const res = await fetch(
@@ -244,7 +321,7 @@ export default function Agent() {
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ call_id: callId, approved }),
+                body: JSON.stringify({ call_id: callId, approved, answer }),
             },
         ).catch(() => null);
         if (!res?.ok) {
@@ -376,7 +453,7 @@ export default function Agent() {
                             </motion.div>
                             <span className="text-sm text-muted-foreground">
                                 {waitingForUser
-                                    ? 'Waiting for your approval'
+                                    ? 'Waiting for you'
                                     : loading
                                       ? 'Working…'
                                       : 'Ready'}
@@ -418,10 +495,77 @@ export default function Agent() {
                                                     }
                                                     duration={turn.seconds ?? 0}
                                                 />
-                                                {approvals(
+                                                {latestTodos(turn.events ?? [])
+                                                    .length > 0 && (
+                                                    <TodoList
+                                                        items={latestTodos(
+                                                            turn.events ?? [],
+                                                        )}
+                                                        title="Plan"
+                                                        defaultOpen
+                                                    />
+                                                )}
+                                                {userRequests(
                                                     turn.events ?? [],
-                                                ).map(({ call, status }) => {
+                                                ).map((req) => {
+                                                    const { call, decided } =
+                                                        req;
                                                     const key = `${turn.runId}/${call.id}`;
+                                                    const sending =
+                                                        !decided &&
+                                                        deciding.has(key);
+                                                    if (
+                                                        call.name === 'ask_user'
+                                                    ) {
+                                                        const a = (call.args ??
+                                                            {}) as {
+                                                            question?: string;
+                                                            options?: string[];
+                                                        };
+                                                        return (
+                                                            <QuestionCard
+                                                                key={key}
+                                                                question={
+                                                                    a.question ??
+                                                                    ''
+                                                                }
+                                                                options={
+                                                                    a.options
+                                                                }
+                                                                status={
+                                                                    !decided
+                                                                        ? sending
+                                                                            ? 'sending'
+                                                                            : 'pending'
+                                                                        : decided.approved
+                                                                          ? 'answered'
+                                                                          : 'skipped'
+                                                                }
+                                                                answer={
+                                                                    decided?.text
+                                                                }
+                                                                onAnswer={(
+                                                                    answer,
+                                                                ) =>
+                                                                    decide(
+                                                                        turn.runId!,
+                                                                        call.id,
+                                                                        true,
+                                                                        answer,
+                                                                    )
+                                                                }
+                                                                onSkip={() =>
+                                                                    decide(
+                                                                        turn.runId!,
+                                                                        call.id,
+                                                                        false,
+                                                                    )
+                                                                }
+                                                            />
+                                                        );
+                                                    }
+                                                    const status =
+                                                        approvalStatus(req);
                                                     return (
                                                         <ToolApproval
                                                             key={key}
@@ -434,9 +578,7 @@ export default function Agent() {
                                                             status={
                                                                 status ===
                                                                     'pending' &&
-                                                                deciding.has(
-                                                                    key,
-                                                                )
+                                                                sending
                                                                     ? 'approving'
                                                                     : status
                                                             }
@@ -457,6 +599,23 @@ export default function Agent() {
                                                         />
                                                     );
                                                 })}
+                                                {screenshots(
+                                                    turn.events ?? [],
+                                                ).map((id) => (
+                                                    <a
+                                                        key={id}
+                                                        href={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                    >
+                                                        <img
+                                                            src={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
+                                                            alt="Screenshot of the page the agent was on"
+                                                            className="max-h-96 rounded-lg border"
+                                                            loading="lazy"
+                                                        />
+                                                    </a>
+                                                ))}
                                                 {turn.status !== 'working' &&
                                                     turn.text}
                                             </MessageContent>
