@@ -1,0 +1,36 @@
+{
+  "status": "done",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Say hi through the contact form."
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "submit_form",
+          "args": {
+            "url": "https://example.com/contact"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "text": "The user declined this action.",
+      "call_id": "c1",
+      "is_error": true
+    },
+    {
+      "role": "assistant",
+      "text": "Okay, I won't send it."
+    }
+  ],
+  "turns": 2,
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  }
+}

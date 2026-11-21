@@ -8,18 +8,17 @@ import (
 )
 
 // Load sets variables from the file at path that are not already in the
-// environment, so a binary also works when started without `make`.
+// environment, so a binary also works when started without `make`. A key
+// repeated in the file takes its last value, as make's `include` and Docker
+// Compose do; otherwise the worker and the containers can disagree (a
+// duplicated OBSCURA_CDP_TOKEN line once meant every browse got a 401).
 func Load(path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-
-		}
-	}(f)
+	defer f.Close()
+	vars := map[string]string{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -30,9 +29,10 @@ func Load(path string) {
 		if !ok {
 			continue
 		}
-		k = strings.TrimSpace(k)
-		v = strings.Trim(strings.TrimSpace(v), `"'`)
-		if _, set := os.LookupEnv(k); !set || os.Getenv(k) == "" {
+		vars[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
+	}
+	for k, v := range vars {
+		if os.Getenv(k) == "" {
 			os.Setenv(k, v)
 		}
 	}

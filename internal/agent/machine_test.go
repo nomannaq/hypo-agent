@@ -29,6 +29,7 @@ func TestStateMachineMatchesTable(t *testing.T) {
 		"thinking":       thinking,
 		"acting(1 left)": must(thinking, Event{Kind: ModelReply, ToolCalls: one}),
 		"acting(2 left)": must(thinking, Event{Kind: ModelReply, ToolCalls: two}),
+		"waiting":        must(must(thinking, Event{Kind: ModelReply, ToolCalls: one}), Event{Kind: ApprovalRequested, CallID: "c1"}),
 		"done":           must(thinking, Event{Kind: ModelReply, Text: "a"}),
 		"failed":         must(idle, Event{Kind: Failed, Err: "x"}),
 	}
@@ -39,6 +40,8 @@ func TestStateMachineMatchesTable(t *testing.T) {
 		{Kind: ModelReply, Text: "a"},
 		{Kind: ModelReply, ToolCalls: one},
 		{Kind: ToolResult, CallID: "c1", Text: "out"},
+		{Kind: ApprovalRequested, CallID: "c1"},
+		{Kind: ApprovalDecided, CallID: "c1", Approved: true},
 		{Kind: Failed, Err: "x"},
 	}
 

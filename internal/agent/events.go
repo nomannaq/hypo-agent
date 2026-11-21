@@ -25,6 +25,13 @@ const (
 	ToolResult
 	// Failed ends the run: Err says why (guard tripped, model error, ...).
 	Failed
+	// ApprovalRequested pauses the run before a tool call with side effects:
+	// CallID is the pending call the user is asked to approve.
+	ApprovalRequested
+	// ApprovalDecided carries the user's answer for CallID: Approved, and Text
+	// for why it wasn't (declined, no answer in time). The call's ToolResult
+	// follows: its output if approved, an error result if not.
+	ApprovalDecided
 
 	numEventKinds // not a kind: the count, for the arrays below
 )
@@ -34,6 +41,9 @@ var eventKindNames = [...]string{
 	ModelReply:  "model_reply",
 	ToolResult:  "tool_result",
 	Failed:      "failed",
+
+	ApprovalRequested: "approval_requested",
+	ApprovalDecided:   "approval_decided",
 }
 
 // Compile-time check: adding a kind without a name changes the array length.
@@ -70,6 +80,7 @@ type Event struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	CallID    string     `json:"call_id,omitempty"`
 	IsError   bool       `json:"is_error,omitempty"`
+	Approved  bool       `json:"approved,omitempty"`
 	Usage     Usage      `json:"usage,omitzero"`
 	Err       string     `json:"err,omitempty"`
 }

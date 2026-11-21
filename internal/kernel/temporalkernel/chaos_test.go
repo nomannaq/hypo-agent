@@ -15,6 +15,7 @@ import (
 	"nomanqureshi.dev/hpyo-agent/internal/executor"
 	"nomanqureshi.dev/hpyo-agent/internal/kernel/temporalkernel"
 	"nomanqureshi.dev/hpyo-agent/internal/model"
+	"nomanqureshi.dev/hpyo-agent/internal/tool"
 )
 
 type fakeModel func(context.Context, model.Request) (model.Response, error)
@@ -28,6 +29,8 @@ type fakeTools func(context.Context, string, json.RawMessage) (string, error)
 func (fakeTools) Specs() []model.Tool {
 	return []model.Tool{{Type: "function", Function: model.ToolFunction{Name: "search"}}}
 }
+
+func (fakeTools) Effect(string) tool.Effect { return tool.Read }
 
 func (f fakeTools) Call(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	return f(ctx, name, args)
@@ -114,5 +117,86 @@ func TestChaosRunSurvivesWorkerLoss(t *testing.T) {
 	}
 	if toolCalls.Load() != 2 {
 		t.Errorf("tool called %d times, want 2 (interrupted attempt + retry)", toolCalls.Load())
+	}
+}
+
+type writeTools struct{ fakeTools }
+
+func (writeTools) Effect(string) tool.Effect { return tool.Write }
+
+// A Write tool call waits on Temporal for the approval signal, sent the way
+// the server sends it (a JSON executor.Approval as raw bytes, named after
+// the approval_requested event's seq), and runs once approved.
+func TestApprovalSignalOnTemporal(t *testing.T) {
+	if devErr != nil {
+		t.Skipf("Temporal dev server unavailable: %v", devErr)
+	}
+	var toolCalls atomic.Int32
+	requested := make(chan int, 1)
+	r := &executor.Runner{
+		Model: fakeModel(func(_ context.Context, req model.Request) (model.Response, error) {
+			for _, m := range req.Messages {
+				if m.Role == "tool" {
+					return model.Response{Content: "sent"}, nil
+				}
+			}
+			return model.Response{ToolCalls: []model.ToolCall{{
+				ID: "c1", Type: "function", Function: model.FunctionCall{Name: "search", Arguments: `{}`},
+			}}}, nil
+		}),
+		Tools: writeTools{fakeTools(func(context.Context, string, json.RawMessage) (string, error) {
+			toolCalls.Add(1)
+			return "ok", nil
+		})},
+		Events: func(_ context.Context, _ string, seq int, e agent.Event) error {
+			if e.Kind == agent.ApprovalRequested {
+				select {
+				case requested <- seq:
+				default:
+				}
+			}
+			return nil
+		},
+	}
+	queue := "approval-" + rand.Text()[:8]
+	w := worker.New(dev.Client(), queue, worker.Options{})
+	temporalkernel.RegisterWorkflow(w, executor.WorkflowName, r.Workflow, temporalkernel.Options{})
+	for name, fn := range r.Activities() {
+		temporalkernel.RegisterActivity(w, name, fn)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	input, _ := json.Marshal(executor.Input{Prompt: "send it"})
+	run, err := dev.Client().ExecuteWorkflow(t.Context(), client.StartWorkflowOptions{ID: queue, TaskQueue: queue}, executor.WorkflowName, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq int
+	select {
+	case seq = <-requested:
+	case <-time.After(30 * time.Second):
+		t.Fatal("no approval was requested")
+	}
+	if toolCalls.Load() != 0 {
+		t.Fatal("the tool ran before it was approved")
+	}
+	payload, _ := json.Marshal(executor.Approval{Approved: true})
+	if err := dev.Client().SignalWorkflow(t.Context(), queue, "", executor.ApprovalSignal(seq), payload); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	var out []byte
+	if err := temporalkernel.Result(run.Get(ctx, &out)); err != nil {
+		t.Fatal(err)
+	}
+	var s agent.State
+	_ = json.Unmarshal(out, &s)
+	if s.Status != agent.Done || toolCalls.Load() != 1 {
+		t.Fatalf("status %s, tool calls %d", s.Status, toolCalls.Load())
 	}
 }

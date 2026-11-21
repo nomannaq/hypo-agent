@@ -25,4 +25,7 @@ seed:          ; go run ./cmd/server seed
 fresh:         ; go run ./cmd/migrate reset && go run ./cmd/migrate up && go run ./cmd/server seed
 build:         ; cd web && npm run build
 test:          ; go test -race ./...
-smoke:         ; go test -count=1 -v -run Smoke ./internal/model   # real Nebius call
+# Live checks: a real Nebius call, and browse/search on the compose services.
+smoke:
+	SEARXNG_URL=$${SEARXNG_URL:-http://localhost:8888} OBSCURA_URL=$${OBSCURA_URL:-http://localhost:9222} \
+		go test -count=1 -v -run Smoke ./internal/model ./internal/tool

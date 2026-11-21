@@ -53,7 +53,10 @@ export default function AgentLayout({
                             <AnimatedSidebarMenuItem>
                                 <AnimatedSidebarMenuButton
                                     icon={<Plus />}
-                                    onSelect={() => router.visit(agent().url)}
+                                    onSelect={() => {
+                                        sessionStorage.removeItem('hypo.agent.turns');
+                                        router.visit(agent().url);
+                                    }}
                                 >
                                     New chat
                                 </AnimatedSidebarMenuButton>

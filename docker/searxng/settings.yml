@@ -1,0 +1,10 @@
+# SearXNG for local development: the agent's web_search tool queries its JSON
+# API. Published on host loopback only (compose.yml).
+use_default_settings: true
+server:
+  # Dev only: the instance is bound to 127.0.0.1 and holds no user data.
+  secret_key: "hypo-agent-dev-only-not-a-secret"
+  limiter: false
+  image_proxy: false
+search:
+  formats: [html, json]
