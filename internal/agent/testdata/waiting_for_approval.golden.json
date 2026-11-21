@@ -1,0 +1,36 @@
+{
+  "status": "waiting",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Say hi through the contact form."
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "c1",
+          "name": "submit_form",
+          "args": {
+            "url": "https://example.com/contact"
+          }
+        }
+      ]
+    }
+  ],
+  "pending": [
+    {
+      "id": "c1",
+      "name": "submit_form",
+      "args": {
+        "url": "https://example.com/contact"
+      }
+    }
+  ],
+  "awaiting": "c1",
+  "turns": 1,
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  }
+}
