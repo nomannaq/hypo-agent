@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,5 +199,56 @@ func TestApprovalSignalOnTemporal(t *testing.T) {
 	_ = json.Unmarshal(out, &s)
 	if s.Status != agent.Done || toolCalls.Load() != 1 {
 		t.Fatalf("status %s, tool calls %d", s.Status, toolCalls.Load())
+	}
+}
+
+// research starts its subagents as Temporal child workflows (the same agent
+// workflow, run as subagents) and collects their answers.
+func TestResearchSubagentsOnTemporal(t *testing.T) {
+	if devErr != nil {
+		t.Skipf("Temporal dev server unavailable: %v", devErr)
+	}
+	r := &executor.Runner{
+		Model: fakeModel(func(_ context.Context, req model.Request) (model.Response, error) {
+			last := req.Messages[len(req.Messages)-1]
+			switch {
+			case strings.Contains(last.Content, "research subagent"):
+				topic, _, _ := strings.Cut(last.Content, "\n")
+				return model.Response{Content: "found " + topic}, nil
+			case last.Role == "tool":
+				return model.Response{Content: last.Content}, nil
+			}
+			return model.Response{ToolCalls: []model.ToolCall{{ID: "r1", Type: "function", Function: model.FunctionCall{
+				Name: tool.ResearchName, Arguments: `{"tasks":[{"title":"A","prompt":"x"},{"title":"B","prompt":"y"}]}`,
+			}}}}, nil
+		}),
+		Tools: tool.Registry{tool.Research()},
+	}
+	queue := "research-" + rand.Text()[:8]
+	w := worker.New(dev.Client(), queue, worker.Options{})
+	temporalkernel.RegisterWorkflow(w, executor.WorkflowName, r.Workflow, temporalkernel.Options{})
+	for name, fn := range r.Activities() {
+		temporalkernel.RegisterActivity(w, name, fn)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	input, _ := json.Marshal(executor.Input{Prompt: "compare"})
+	run, err := dev.Client().ExecuteWorkflow(t.Context(), client.StartWorkflowOptions{ID: queue, TaskQueue: queue}, executor.WorkflowName, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	var out []byte
+	if err := temporalkernel.Result(run.Get(ctx, &out)); err != nil {
+		t.Fatal(err)
+	}
+	var s agent.State
+	_ = json.Unmarshal(out, &s)
+	if got, want := s.Messages[len(s.Messages)-1].Text, "## A\nfound x\n\n## B\nfound y"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

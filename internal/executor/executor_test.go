@@ -368,3 +368,138 @@ func TestLedgerStopsARetriedWriteFromRepeating(t *testing.T) {
 		t.Errorf("ledger keys %v, want the same run/step key twice", keys)
 	}
 }
+
+type modelFunc func(model.Request) model.Response
+
+func (f modelFunc) Complete(_ context.Context, req model.Request) (model.Response, error) {
+	return f(req), nil
+}
+
+// lastTool is the newest tool result the model has been shown.
+func lastTool(req model.Request) string {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "tool" {
+			return req.Messages[i].Content
+		}
+	}
+	return ""
+}
+
+func TestBudgetStopsRepeatedCalls(t *testing.T) {
+	var searches atomic.Int32
+	reg := tool.Registry{tool.Typed("search", "", `{}`, func(context.Context, struct{}) (string, error) {
+		searches.Add(1)
+		return "results", nil
+	})}
+	turn := 0
+	m := modelFunc(func(req model.Request) model.Response {
+		turn++
+		if turn <= 2 {
+			return model.Response{ToolCalls: []model.ToolCall{toolCall(fmt.Sprint("c", turn), "search", `{}`)}}
+		}
+		return model.Response{Content: lastTool(req)}
+	})
+	lim := DefaultLimits
+	lim.Budgets = map[string]int{"search": 1}
+	s, err := run(t, memkernel.New(), &Runner{Model: m, Tools: reg, Limits: lim}, "r1", "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if searches.Load() != 1 || !strings.Contains(s.Messages[len(s.Messages)-1].Text, "Budget used up") {
+		t.Errorf("searches %d, final %q", searches.Load(), s.Messages[len(s.Messages)-1].Text)
+	}
+}
+
+func TestAskUserWaitsForTheAnswer(t *testing.T) {
+	for name, c := range map[string]struct {
+		answer Approval
+		want   string
+	}{
+		"answered": {Approval{Approved: true, Answer: "blue"}, "The user answered: blue"},
+		"skipped":  {Approval{Approved: false}, "No answer: the user declined it"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := modelFunc(func(req model.Request) model.Response {
+				if out := lastTool(req); out != "" {
+					return model.Response{Content: out}
+				}
+				return model.Response{ToolCalls: []model.ToolCall{toolCall("q1", tool.AskUserName, `{"question":"Which colour?"}`)}}
+			})
+			k := memkernel.New()
+			payload, _ := json.Marshal(c.answer)
+			_ = k.Signal(t.Context(), "r1", ApprovalSignal(2), payload) // event 2: approval_requested
+			var kinds []string
+			r := &Runner{Model: m, Tools: tool.Registry{tool.AskUser()}, Events: func(_ context.Context, _ string, _ int, e agent.Event) error {
+				kinds = append(kinds, e.Kind.String())
+				return nil
+			}}
+			s, err := run(t, k, r, "r1", "paint it")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := s.Messages[len(s.Messages)-1].Text; !strings.Contains(got, c.want) {
+				t.Errorf("model was told %q, want %q", got, c.want)
+			}
+			if !slices.Contains(kinds, "approval_requested") || !slices.Contains(kinds, "approval_decided") {
+				t.Errorf("events %v", kinds)
+			}
+		})
+	}
+}
+
+// research runs one child per task, each a full agent run without
+// ask_user/research/Write tools and without streamed events, and returns
+// their answers under the task titles.
+func TestResearchRunsSubagents(t *testing.T) {
+	var mu sync.Mutex
+	childTools := map[string][]string{}
+	m := modelFunc(func(req model.Request) model.Response {
+		prompt := req.Messages[len(req.Messages)-1]
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content, "research subagent") {
+				topic, _, _ := strings.Cut(msg.Content, "\n")
+				var names []string
+				for _, t := range req.Tools {
+					names = append(names, t.Function.Name)
+				}
+				mu.Lock()
+				childTools[topic] = names
+				mu.Unlock()
+				return model.Response{Content: "findings on " + topic}
+			}
+		}
+		if prompt.Role == "tool" {
+			return model.Response{Content: prompt.Content}
+		}
+		return model.Response{ToolCalls: []model.ToolCall{toolCall("r1", tool.ResearchName,
+			`{"tasks":[{"title":"A","prompt":"topic A"},{"title":"B","prompt":"topic B"}]}`)}}
+	})
+	reg := tool.Registry{tool.AskUser(), tool.Research(), tool.Typed("search", "", `{}`, func(context.Context, struct{}) (string, error) { return "", nil })}
+	var parentEvents int
+	r := &Runner{Model: m, Tools: reg, Events: func(_ context.Context, runID string, _ int, _ agent.Event) error {
+		if runID != "p1" {
+			t.Errorf("a subagent streamed an event as %s", runID)
+		}
+		parentEvents++
+		return nil
+	}}
+	s, err := run(t, memkernel.New(), r, "p1", "compare A and B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s.Messages[len(s.Messages)-1].Text
+	if want := "## A\nfindings on topic A\n\n## B\nfindings on topic B"; got != want {
+		t.Errorf("research result %q, want %q", got, want)
+	}
+	if len(childTools) != 2 {
+		t.Fatalf("subagents run: %v", childTools)
+	}
+	for topic, names := range childTools {
+		if !slices.Equal(names, []string{"search"}) {
+			t.Errorf("subagent %q was offered %v, want only [search]", topic, names)
+		}
+	}
+	if parentEvents != 4 { // user_message, model_reply, tool_result, model_reply
+		t.Errorf("parent events %d, want 4", parentEvents)
+	}
+}
