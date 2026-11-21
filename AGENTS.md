@@ -39,16 +39,18 @@ Inertia (gonertia) + React 19 + Tailwind 4 frontend, Nebius Token Factory
 | `cmd/server`: auth, sessions, runs | **Done**: `POST /api/runs` starts a durable run; `GET /api/runs/{id}/events` streams its events (SSE) |
 | `cmd/worker` | **Done**: runs agent workflows and activities, persists run events; survives being killed mid-run |
 | Web UI: beUI chat shell, orb, messages, activity | **Done**: follows runs step by step, reattaches after a reload |
-| `internal/tool` | **Registry, effects, tools**: `web_search` (SearXNG); `browse`, `inspect_forms`, `submit_form` (Obscura headless browser). `submit_form` is a Write tool: approved by the user, run once via the ledger. Sandbox is a stub |
-| Approvals, idempotency ledger | **Done**: `waiting` state, approval card in the UI, `POST /api/runs/{id}/approvals`, `tool_ledger` table; tested on memkernel and Temporal |
+| `internal/tool` | **Registry, effects, 16 tools**: web (`web_search`, `browse`), a per-run browser session (`browser_open`, `_snapshot`, `_click`, `_type`, `_select`, `_press`, `_scroll`, `_back`, `_wait`, `_screenshot`), and run tools (`todo_write`, `ask_user`, `research` subagents). Sandbox is a stub |
+| Approvals, questions, ledger | **Done**: `waiting` state, approval card and question card in the UI, `POST /api/runs/{id}/approvals`, `tool_ledger` table; tested on memkernel and Temporal. No tool is Write today (browser actions are autonomous by choice) |
+| Subagents, budgets, artifacts | **Done**: `research` spawns child runs (Temporal child workflows); per-run tool budgets; screenshots in `run_artifacts`, served by `GET /api/runs/{id}/artifacts/{artifact}` |
 | `internal/runtime`, `internal/memory` | Stubs (roadmap Steps 4–5) |
 | `pgkernel` | Stub (learning path, time-boxed) |
 | Run scheduler, supervisor (rest of Step 4) | Stubs in `internal/runtime` |
 | `skills/`, `sandbox/images/` | Empty (Step 6, and the sandbox runner) |
 
-Roadmap Steps 1 (agent core), 2 (tool registry, web tools, approvals and the
-idempotency ledger) and 3 (streaming runs to the UI), and the durable-execution
-part of Step 4, are complete (see `.junie/plans/durability.md`). Next: the rest
+Roadmap Steps 1 (agent core), 2 (tool registry, web and browser tools,
+approvals, questions, subagents, budgets and the idempotency ledger) and 3
+(streaming runs to the UI), and the durable-execution part of Step 4, are
+complete (see `.junie/plans/durability.md`). Next: the rest
 of Step 4 (scheduler, supervisor) or Step 5 (memory).
 
 ## Architecture
@@ -118,9 +120,9 @@ internal/
   executor/        agent loop: reducer + kernel + model + tools, with guards
   model/           Nebius client: tool calling, retries, usage metering
   dotenv/          .env loader for binaries started without make
-  tool/            tool registry + read-only tools (web_search, browse)
+  tool/            tool registry, web + browser-session tools, run tools (todo, ask_user, research)
   runtime/ memory/ stubs for roadmap Steps 4-5
-db/migrations/     goose SQL migrations (users/sessions, pgkernel tables, agent_runs/run_events)
+db/migrations/     goose SQL migrations (users/sessions, pgkernel, agent_runs/run_events, tool_ledger, run_artifacts)
 web/               Vite + React frontend (see "Frontend" below)
 docker/            config for compose services (searxng/settings.yml)
 skills/ sandbox/   future skills and tool sandbox images
@@ -227,7 +229,7 @@ replay, and stream to the UI.
 | `tool_result` | `CallID`, `Text` (output), `IsError` |
 | `failed` | `Err` (why the run ended) |
 | `approval_requested` | `CallID` (a pending Write call) |
-| `approval_decided` | `CallID`, `Approved`, `Text` (why not, if declined) |
+| `approval_decided` | `CallID`, `Approved`, `Text` (why not, if declined; the answer, for an `ask_user` question) |
 
 ### Transitions
 
@@ -308,27 +310,65 @@ registry must be the same on every worker and must not change under live runs.
 | Tool | Backend | Notes |
 |---|---|---|
 | `web_search` | SearXNG JSON API (`SEARXNG_URL`) | `{query, limit}`; limit defaults to 5, capped at 10 |
-| `browse` | Obscura over CDP (`OBSCURA_URL`, `OBSCURA_CDP_TOKEN`) | `{url}`, http(s) only; fresh browser context per call; returns title, final URL, Markdown |
-| `inspect_forms` | Obscura | `{url}`; lists each form's method, action and fields (name, type, label, options) |
-| `submit_form` | Obscura | **Write.** `{url, form, fields}`; fills the fields, calls `requestSubmit()`, returns the resulting page |
+| `browse` | Obscura over CDP (`OBSCURA_URL`, `OBSCURA_CDP_TOKEN`) | `{url}`; reads a page in a fresh browser context: title, URL, Markdown. Stateless, so subagents use it freely |
+| `browser_open` | Obscura | `{url}`; opens the run's session page (replacing any open one) |
+| `browser_snapshot` | Obscura | numbered interactive elements (`[3] button "Send"`, current values), then up to 8 KB of page Markdown |
+| `browser_click` / `_type` / `_select` / `_press` | Obscura | act on an element number; `_type` uses CDP `Input.insertText` (+ `submit` presses Enter); `_press` sends real CDP key events |
+| `browser_scroll` / `_back` / `_wait` | Obscura | down/up/top/bottom; history back; wait (≤20 s) for text to appear |
+| `browser_screenshot` | Obscura + `run_artifacts` | PNG stored per run, shown in the chat; the model only gets `[artifact:<id>]` |
+| `todo_write` | none | the agent's plan; the chat renders the latest list (beUI `TodoList`) |
+| `ask_user` | executor | pauses the run for the user's answer (see Approvals) |
+| `research` | executor | up to 4 parallel subagents (see Subagents) |
+
+Every action tool reports where the page is afterwards, following any
+navigation it started (`page.settle`: a `frameNavigated` within a second,
+then its `loadEventFired`). Obscura's SSRF guard refuses private and loopback
+addresses, which keeps pages away from the database and Temporal on the
+compose network. Tool output is untrusted (a page can contain instructions);
+the system prompt tells the model to treat it as data. Outputs over
+`MaxToolOutput` (16 KB) are truncated by the executor.
+
+**Browser sessions** (`internal/tool/session.go`): one page per run, in the
+worker's memory, keyed by the run ID the executor passes in the call's
+context (`tool.WithCall`; the model never names a run). A session is locked
+per call and bound to that call's deadline, and closed after 10 minutes
+unused. It does not survive a worker restart, and with more than one worker a
+run's next call can land where its page isn't: the tool says so and the model
+reopens the page (a `ponytail:` in session.go names the fix, pinning browser
+activities to one worker). Never close sessions from workflow code: a
+deferred call in `executor.Run` also runs when Temporal evicts a cached
+workflow, mid-run.
 
 Each tool has an `Effect` (`tool.Read` or `tool.Write`, an explicit enum in
-`internal/tool/effects.go`). Read tools are safe to repeat. Every browser
-call opens a fresh browser context, so calls share no state. Obscura's SSRF
-guard refuses private and loopback addresses, which keeps pages away from the
-database and Temporal on the compose network. Tool output is untrusted (a
-page can contain instructions); the system prompt tells the model to treat it
-as data. Outputs over `MaxToolOutput` (16 KB) are truncated by the executor.
+`internal/tool/effects.go`). Browser actions are Read by choice: the agent acts
+on sites without asking. Set `Effect = tool.Write` on a tool to make every call
+wait for approval and go through the ledger.
+
+**Budgets** (`Limits.Budgets`, by tool name): `web_search` 20, `browse` 25,
+`browser_open` 25, `research` 2 per run. Counted from the run's own messages,
+so they are durable and need no worker state; a call over budget gets an error
+result telling the model to work with what it has.
 
 To add a tool: write a `tool.Typed(...)` constructor in `internal/tool`, add a
 test (an `httptest` fake for HTTP backends, a gated `TestSmoke*` for the live
-service), and add it to the registry in `cmd/worker`. If it changes anything
-outside the run, set `Effect = tool.Write`; the approval and ledger come with it.
+service), and add it to the registry in `cmd/worker`.
 
-### Approvals
+### Subagents
 
-A Write call never runs without the user's answer
-(`internal/executor/executor.go`, the `Acting` case):
+`research {tasks: [{title, prompt}]}` is carried out in workflow code
+(`Runner.research`): one `c.Spawn` per task (Temporal child workflows
+`<run>/<n>` on the same queue, so they run in parallel), then each child's
+final answer under its title. A child is a full agent run with
+`Input.Subagent` set: it is offered no `ask_user`, `research` or Write tools,
+its events aren't streamed (the parent's tool result reports it), and its
+screenshots and ledger entries belong to the top-level run. Each child has its
+own turn limit and budgets.
+
+### Approvals and questions
+
+A Write call never runs without the user's answer, and an `ask_user` question
+waits for one; both use the same pause (`internal/executor/executor.go`, the
+`Acting` case):
 
 1. The executor appends `approval_requested` (event seq N); the run is
    `waiting`.
@@ -343,11 +383,19 @@ A Write call never runs without the user's answer
 4. The executor appends `approval_decided`. If approved, the tool runs through
    the ledger. If declined, it times out, or the payload is unreadable, the
    model gets an error result ("Not performed: …") and the tool never runs.
+5. For `ask_user` the UI shows a question card (options as buttons, a free
+   answer, Skip) and POSTs `{call_id, approved: true, answer}`; the answer is
+   `approval_decided.Text` and the tool result. Skipped or timed out, the
+   model is told to continue without it.
 
 Tests: `TestWriteToolRunsOnlyWhenApproved` (approve, decline, timeout),
-`TestLedgerStopsARetriedWriteFromRepeating`, and
-`TestApprovalSignalOnTemporal`, which signals the way the server does. All
-were checked against a deliberately removed gate or ledger.
+`TestAskUserWaitsForTheAnswer`, `TestLedgerStopsARetriedWriteFromRepeating`,
+`TestBudgetStopsRepeatedCalls`, `TestResearchRunsSubagents` (and
+`TestResearchSubagentsOnTemporal`), and `TestApprovalSignalOnTemporal`, which
+signals the way the server does. Each was checked against a deliberately
+removed gate, ledger, budget or subagent filter. `TestSmokeBrowserSession`
+(`make smoke`) walks a real form: open, snapshot, type, click submit, back,
+scroll, wait, screenshot.
 
 ## Model gateway
 
