@@ -7,6 +7,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"errors"
 	"log"
 	"os"
@@ -42,23 +43,41 @@ func main() {
 
 	obscura, obscuraToken := cmp.Or(os.Getenv("OBSCURA_URL"), "http://localhost:9222"), os.Getenv("OBSCURA_CDP_TOKEN")
 	if obscuraToken == "" {
-		log.Print("warning: OBSCURA_CDP_TOKEN is not set; the browse tool will fail (401). Set it in .env and run `make up`.")
+		log.Print("warning: OBSCURA_CDP_TOKEN is not set; the browser tools will fail (401). Set it in .env and run `make up`.")
 	}
 
 	runner := &executor.Runner{
 		Model:  model.NewClient(os.Getenv("NEBIUS_TOKEN_FACTORY"), os.Getenv("NEBIUS_BASE_URL"), os.Getenv("NEBIUS_MODEL")),
 		System: executor.SystemPrompt,
-		// Tools on the compose services (`make up`). Browser tools are
-		// session-based: browser_open creates a session, then browser_snapshot,
-		// browser_click, browser_type, and browser_press act on it. Clicks and
-		// typing are Write tools: each call waits for the user's approval.
+		// Tools on the compose services (`make up`). browse reads a page in a
+		// fresh browser; the browser_* tools share one page per run so the
+		// agent can click through a site. They run without approval, by
+		// choice: the agent is autonomous in the browser.
 		Tools: tool.Registry{
+			tool.TodoWrite(),
+			tool.AskUser(),
+			tool.Research(),
 			tool.WebSearch(cmp.Or(os.Getenv("SEARXNG_URL"), "http://localhost:8888")),
+			tool.Browse(obscura, obscuraToken),
 			tool.BrowserOpen(obscura, obscuraToken),
 			tool.BrowserSnapshot(),
 			tool.BrowserClick(),
 			tool.BrowserType(),
+			tool.BrowserSelect(),
 			tool.BrowserPress(),
+			tool.BrowserScroll(),
+			tool.BrowserBack(),
+			tool.BrowserWait(),
+			tool.BrowserScreenshot(func(ctx context.Context, runID, key, mime string, data []byte) (string, error) {
+				// Subagent runs are "<parent>/<n>": artifacts belong to the
+				// top-level run the user owns.
+				root, _, _ := strings.Cut(runID, "/")
+				var id string
+				err := db.QueryRow(ctx, `INSERT INTO run_artifacts (id, key, run_id, mime, data) VALUES ($1, $2, $3, $4, $5)
+					ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data RETURNING id`,
+					"a-"+rand.Text(), key, root, mime, data).Scan(&id)
+				return id, err
+			}),
 		},
 		// The append can be retried after it landed; the (run_id, seq) key
 		// makes the retry a no-op. The insert trigger wakes the server's streams.

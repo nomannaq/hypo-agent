@@ -81,6 +81,7 @@ func main() {
 	mux.HandleFunc("POST /api/runs", s.authOnly(s.startRun))
 	mux.HandleFunc("GET /api/runs/{id}/events", s.authOnly(s.runEvents))
 	mux.HandleFunc("POST /api/runs/{id}/approvals", s.authOnly(s.decideApproval))
+	mux.HandleFunc("GET /api/runs/{id}/artifacts/{artifact}", s.authOnly(s.artifact))
 	mux.Handle("GET /settings", http.RedirectHandler("/settings/profile", http.StatusFound))
 	mux.HandleFunc("GET /settings/profile", s.authOnly(s.page("settings/profile")))
 	mux.HandleFunc("PATCH /settings/profile", s.authOnly(s.updateProfile))

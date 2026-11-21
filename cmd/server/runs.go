@@ -90,8 +90,13 @@ func (s *server) decideApproval(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		CallID   string `json:"call_id"`
 		Approved bool   `json:"approved"`
+		Answer   string `json:"answer"` // for an ask_user question
 	}
 	if !s.decode(w, r, &in) {
+		return
+	}
+	if len(in.Answer) > 4000 {
+		http.Error(w, "the answer is too long", http.StatusBadRequest)
 		return
 	}
 	ctx := r.Context()
@@ -112,13 +117,35 @@ func (s *server) decideApproval(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nothing is waiting for that approval", http.StatusConflict)
 		return
 	}
-	payload, _ := json.Marshal(executor.Approval{Approved: in.Approved})
+	payload, _ := json.Marshal(executor.Approval{Approved: in.Approved, Answer: strings.TrimSpace(in.Answer)})
 	if err := s.temporal.SignalWorkflow(ctx, id, "", executor.ApprovalSignal(seq), payload); err != nil {
 		log.Printf("run %s: approval signal: %v", id, err)
 		http.Error(w, "the agent runtime is unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// artifact serves a file a tool produced for the run (a screenshot), to the
+// run's owner only.
+func (s *server) artifact(w http.ResponseWriter, r *http.Request) {
+	var mime string
+	var data []byte
+	err := s.db.QueryRow(r.Context(), `SELECT a.mime, a.data FROM run_artifacts a JOIN agent_runs r ON r.id = a.run_id
+		WHERE a.id = $1 AND a.run_id = $2 AND r.user_id = $3`,
+		r.PathValue("artifact"), r.PathValue("id"), currentUser(r).ID).Scan(&mime, &data)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=86400") // an artifact never changes once its run is done
+	_, _ = w.Write(data)
 }
 
 // runEvents streams a run's events as server-sent events: `id` is the event's
