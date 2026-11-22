@@ -20,3 +20,6 @@ export const cancelSchedule = (id: string) =>
 export const login = route('/login');
 export const register = route('/register');
 export const logout = route('/logout', 'post');
+
+export const cancelRun = (id: string) =>
+    route(`/api/runs/${encodeURIComponent(id)}/cancel`, 'post')();

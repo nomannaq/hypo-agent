@@ -50,10 +50,10 @@ var errInvalidRun = errors.New("invalid run request")
 func (s *server) admitRun(ctx context.Context, owner int64, in runRequest) (runtime.Receipt, error) {
 	req := runtime.Request{
 		ID: "run-" + rand.Text(), Owner: owner, RequestID: in.RequestID,
-		Input: executor.Input{Workflow: executor.DiscoveryWorkflowName, Skills: s.skills},
+		Input: executor.Input{Workflow: executor.ResponsiveWorkflowName, Skills: s.skills},
 	}
 	if in.DeepResearch {
-		req.Input.Workflow = executor.DeepResearchWorkflowV2
+		req.Input.Workflow = executor.DeepResearchWorkflowV4
 	}
 	if in.Messages != nil {
 		n := len(in.Messages)
@@ -135,7 +135,7 @@ func (s *server) startWorkflow(ctx context.Context, id string, input []byte) err
 	switch workflowName {
 	case "":
 		workflowName = executor.WorkflowName
-	case executor.MemoryWorkflowName, executor.SkillsWorkflowName, executor.SchedulingWorkflowName, executor.ScheduledWorkflowName, executor.RecurringWorkflowName, executor.MessagingWorkflowName, executor.DiscoveryWorkflowName, executor.DeepResearchWorkflowName, executor.DeepResearchWorkflowV2:
+	case executor.MemoryWorkflowName, executor.SkillsWorkflowName, executor.SchedulingWorkflowName, executor.ScheduledWorkflowName, executor.RecurringWorkflowName, executor.MessagingWorkflowName, executor.DiscoveryWorkflowName, executor.DeepResearchWorkflowName, executor.DeepResearchWorkflowV2, executor.DeepResearchWorkflowV3, executor.DeepResearchWorkflowV4, executor.OrchestratorWorkflowName, executor.ConversationalWorkflowName, executor.ResponsiveWorkflowName, executor.ScheduledWorkflowV2:
 	default:
 		return fmt.Errorf("unknown workflow type %q", workflowName)
 	}
@@ -166,6 +166,54 @@ func (s *server) inspectWorkflow(ctx context.Context, id string) (bool, error) {
 		return false, err
 	}
 	return desc.GetWorkflowExecutionInfo().GetStatus() == enums.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
+}
+
+func (s *server) workflowCloseReason(ctx context.Context, id string) string {
+	history := s.temporal.GetWorkflowHistory(ctx, id, "", false, enums.HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT)
+	if !history.HasNext() {
+		return ""
+	}
+	event, err := history.Next()
+	if err != nil {
+		return ""
+	}
+	switch event.GetEventType() {
+	case enums.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED:
+		return "The run was terminated before it could finish."
+	case enums.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED:
+		return "The run was cancelled before it could finish."
+	case enums.EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT:
+		return "The run reached its time limit before it could finish."
+	case enums.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
+		return "The workflow failed before it could publish a final reply."
+	default:
+		return ""
+	}
+}
+
+func (s *server) requestRunCancellation(w http.ResponseWriter, r *http.Request) {
+	found, err := s.scheduler.RequestCancellation(r.Context(), r.PathValue("id"), currentUser(r).ID)
+	switch {
+	case err != nil:
+		s.fail(w, err)
+	case !found:
+		http.NotFound(w, r)
+	default:
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+func (s *server) cancelWorkflow(ctx context.Context, id string) error {
+	err := s.temporal.CancelWorkflow(ctx, id, "")
+	var missing *serviceerror.NotFound
+	if errors.As(err, &missing) {
+		return runtime.ErrWorkflowMissing
+	}
+	var alreadyRequested *serviceerror.CancellationAlreadyRequested
+	if errors.As(err, &alreadyRequested) {
+		return nil
+	}
+	return err
 }
 
 // decideApproval answers the run's pending approval request: the run is
@@ -295,16 +343,34 @@ func (s *server) followRun(ctx context.Context, id string, after int, send func(
 	st := agent.Start(nil)
 	next := 0
 	checkRun := false
+	var previous runLifecycle
 	for {
 		// Read the lifecycle before the events so a concurrent terminal
 		// commit cannot be mistaken for a missing final event.
 		var status *string
 		var failure string
-		if err := s.db.QueryRow(ctx, `SELECT status, COALESCE(failure, '') FROM agent_runs WHERE id = $1`, id).
-			Scan(&status, &failure); err != nil {
+		var lifecycle runLifecycle
+		if err := s.db.QueryRow(ctx, `SELECT r.status, COALESCE(r.failure, ''), r.background_research, r.cancel_requested,
+			CASE WHEN r.status <> 'queued' OR r.status IS NULL THEN ''
+			WHEN (SELECT count(*) FROM agent_runs active WHERE active.user_id = r.user_id
+				AND active.background_research = r.background_research AND active.status IN ('starting', 'running'))
+				>= CASE WHEN r.background_research THEN $3::int ELSE $2::int END THEN 'capacity'
+			ELSE '' END
+			FROM agent_runs r WHERE r.id = $1`, id, runtime.MaxForegroundRuns, runtime.MaxBackgroundRuns).
+			Scan(&status, &failure, &lifecycle.BackgroundResearch, &lifecycle.CancelRequested, &lifecycle.WaitingFor); err != nil {
 			log.Printf("run %s: reading status: %v", id, err)
 			return
 		}
+		if status != nil {
+			lifecycle.Status = *status
+			if lifecycle != previous {
+				if err := send(runFrame{Type: "lifecycle", RunID: id, Lifecycle: &lifecycle}); err != nil {
+					return
+				}
+				previous = lifecycle
+			}
+		}
+
 		stopped := status != nil && *status == runtime.Failed.String()
 		if status == nil && checkRun {
 			open, err := s.inspectWorkflow(ctx, id)
