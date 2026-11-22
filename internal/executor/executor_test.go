@@ -503,3 +503,32 @@ func TestResearchRunsSubagents(t *testing.T) {
 		t.Errorf("parent events %d, want 4", parentEvents)
 	}
 }
+
+func TestRecallSnapshotIsJournaled(t *testing.T) {
+	var lookups atomic.Int32
+	r := &Runner{
+		System: "Use relevant context.",
+		Model: modelFunc(func(req model.Request) model.Response {
+			if !strings.Contains(req.Messages[0].Content, "prefers concise reports") {
+				t.Errorf("missing recalled context: %q", req.Messages[0].Content)
+			}
+			return model.Response{Content: "A concise report"}
+		}),
+		Recall: func(_ context.Context, runID, query string) (string, error) {
+			lookups.Add(1)
+			if runID != "r1" || query != "Research fog" {
+				t.Errorf("unexpected recall scope %q, %q", runID, query)
+			}
+			return "prefers concise reports", nil
+		},
+	}
+	k := memkernel.New()
+	for range 2 {
+		if state, err := run(t, k, r, "r1", "Research fog"); err != nil || state.Status != agent.Done {
+			t.Fatalf("run status %s: %v", state.Status, err)
+		}
+	}
+	if lookups.Load() != 1 {
+		t.Fatalf("lookup called %d times across replay", lookups.Load())
+	}
+}

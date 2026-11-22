@@ -112,21 +112,22 @@ The web agent page shows real streamed agent output instead of the fake reply.
 Runs survive worker crashes and pass the conformance and chaos tests.
 
 - ✓ Implement `temporalkernel` and wire a worker (one `cmd/worker`; steps are named activities, not closures; continue-as-new deferred). See `durability.md`.
-- Implement scheduler budgets/caps and supervisor for stuck runs in `internal/runtime`.
+- Durable admission, concurrent-run caps, and workflow reconciliation are implemented in `internal/runtime`. The scheduler integration test passed on Postgres 17.
+- One-shot, daily, and weekly user schedules deliver durable runs to the original conversation. Account-level spend controls are follow-up work.
 - ✓ Add kill-worker chaos test.
 
-Done so far: `/api/chat` runs on Temporal via `cmd/worker`; conformance passes on both kernels; chaos test plus a manual `kill -9` mid-model-call (resumed on a new worker after the heartbeat timeout). Remaining: scheduler and supervisor.
+Runs from `POST /api/runs` execute on Temporal via `cmd/worker`. Both kernels pass conformance, and the Temporal chaos test covers worker loss. The proposed delivery order for durable admission, supervision, memory, skills, and scheduled runs is in [Memory, skills, and scheduling](memory-skills-and-scheduling.md).
 
-###   Step 5: Persistent memory
+### ✓ Step 5: Persistent memory
 The agent recalls facts and summaries across sessions.
 
-- Add `memories` migration with pgvector embeddings.
-- Implement `internal/memory` Store, Compact and recall at turn start.
-- Add remember/recall tools and run-completion summaries.
+- Add an owner-scoped `memories` store with Postgres text search and optional pgvector recall.
+- Bound the transcript history and journal the initial memory snapshot in `agent-memory-v1`.
+- Offer approval-backed `remember`, `recall`, and `session_search`. Add a memory settings page with deletion and opt-in run summaries.
 
-###   Step 6: Skills and tool discovery
-Skills and tools are discovered on demand instead of loaded all at once.
+### * Step 6: Skills and tool discovery
+Skills load on demand through `read_skill`. Tool relevance discovery follows separately.
 
-- Implement skill loader for `skills/` with prompt index and `read_skill` tool.
-- Add tool embeddings and `search_tools` meta-tool that injects only top-k schemas.
-- Ship one real hypothesis-research skill as proof.
+- ✓ Embed repository skills and list names and descriptions in the model prompt.
+- ✓ Ship `hypothesis-research` and pin the catalog in each run's saved workflow input.
+- Add tool embeddings and the `search_tools` meta-tool to select relevant tool schemas.
