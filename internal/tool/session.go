@@ -17,13 +17,9 @@ import (
 // scroll, go back. The run comes from the call's context (WithCall), never
 // from the model.
 //
-// A session lives in this worker's memory. After a worker restart, or if the
-// activity lands on another worker, it is gone: the tools say so and the model
-// opens the page again (the journal can't restore a browser).
-//
-// ponytail: sessions are per worker process; with several workers, pin a run's
-// browser activities to one worker (a per-worker task queue) or keep sessions
-// in Obscura by target ID and reattach.
+// The browser session service holds these pages independently of the workers.
+// Obscura scopes a tab to its CDP connection, so restarting the service or
+// Obscura itself loses the tab.
 
 const (
 	sessionIdleTTL  = 10 * time.Minute // closed after this long unused
@@ -78,6 +74,13 @@ func closeSession(runID string, bs *browserSession) {
 	sessions.Unlock()
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
+	bs.dispose()
+}
+
+func (bs *browserSession) dispose() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	bs.c.bind(ctx)
 	bs.close()
 }
 
@@ -103,7 +106,7 @@ func reapIdle() {
 		sessions.Unlock()
 		for _, bs := range victims {
 			bs.mu.Lock()
-			bs.close()
+			bs.dispose()
 			bs.mu.Unlock()
 		}
 	}

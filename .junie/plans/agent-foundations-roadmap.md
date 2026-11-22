@@ -125,9 +125,12 @@ The agent recalls facts and summaries across sessions.
 - Bound the transcript history and journal the initial memory snapshot in `agent-memory-v1`.
 - Offer approval-backed `remember`, `recall`, and `session_search`. Add a memory settings page with deletion and opt-in run summaries.
 
-### * Step 6: Skills and tool discovery
-Skills load on demand through `read_skill`. Tool relevance discovery follows separately.
+### ✓ Step 6: Skills and tool discovery
+Skills load on demand through `read_skill`. Interactive runs discover
+specialized tool groups through `search_tools`.
 
 - ✓ Embed repository skills and list names and descriptions in the model prompt.
 - ✓ Ship `hypothesis-research` and pin the catalog in each run's saved workflow input.
-- Add tool embeddings and the `search_tools` meta-tool to select relevant tool schemas.
+- ✓ Ship `agent-discovery-v1` with a small starting tool list and
+  deterministic lookup. See [tool discovery](tool-discovery.md) for the
+  comparison with the full-registry profile.

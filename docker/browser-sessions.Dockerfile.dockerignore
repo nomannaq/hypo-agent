@@ -1,0 +1,13 @@
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/browser-sessions/
+!cmd/browser-sessions/*.go
+!internal/
+!internal/dotenv/
+!internal/dotenv/*.go
+!internal/model/
+!internal/model/*.go
+!internal/tool/
+!internal/tool/*.go

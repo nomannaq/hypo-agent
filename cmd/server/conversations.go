@@ -17,7 +17,8 @@ type conversationLink struct {
 type chatRun struct {
 	ID        string         `json:"id"`
 	Prompt    string         `json:"prompt"`
-	Reply     string         `json:"reply"`
+	Messages  []string       `json:"messages"`
+	Failure   string         `json:"failure"`
 	Status    runtime.Status `json:"status"`
 	Scheduled bool           `json:"scheduled,omitempty"`
 }
@@ -51,13 +52,12 @@ func (s *server) agentPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rows, err := s.db.Query(ctx, `SELECT r.id, r.prompt, r.status, CASE r.status
-			WHEN 'succeeded' THEN COALESCE(final.event->>'text', '')
 			WHEN 'failed' THEN COALESCE(r.failure, 'The run stopped without a reply.')
-			ELSE '' END, EXISTS (SELECT 1 FROM schedules WHERE run_id = r.id)
+			ELSE '' END, CASE WHEN r.status IN ('succeeded', 'failed')
+				THEN ARRAY(SELECT body FROM run_assistant_messages(r.id) ORDER BY seq)
+				ELSE ARRAY[]::text[] END, EXISTS (SELECT 1 FROM schedules WHERE run_id = r.id)
 			OR EXISTS (SELECT 1 FROM schedule_occurrences WHERE run_id = r.id)
-			FROM agent_runs r LEFT JOIN LATERAL (
-				SELECT event FROM run_events WHERE run_id = r.id ORDER BY seq DESC LIMIT 1
-			) final ON r.status = 'succeeded'
+			FROM agent_runs r
 			WHERE r.conversation_id = $1 AND r.user_id = $2 ORDER BY r.ordinal`, id, owner)
 		if err != nil {
 			s.fail(w, err)
@@ -66,7 +66,7 @@ func (s *server) agentPage(w http.ResponseWriter, r *http.Request) {
 		runs, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (chatRun, error) {
 			var run chatRun
 			var raw string
-			if err := row.Scan(&run.ID, &run.Prompt, &raw, &run.Reply, &run.Scheduled); err != nil {
+			if err := row.Scan(&run.ID, &run.Prompt, &raw, &run.Failure, &run.Messages, &run.Scheduled); err != nil {
 				return run, err
 			}
 			return run, run.Status.UnmarshalText([]byte(raw))

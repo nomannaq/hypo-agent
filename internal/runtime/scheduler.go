@@ -225,8 +225,8 @@ func (s Scheduler) claim(ctx context.Context) (string, []byte, error) {
 func chatHistory(ctx context.Context, tx pgx.Tx, chat string, before int64) ([]agent.Message, error) {
 	// The final event and succeeded status commit together. Read recent
 	// complete turns in reverse and then restore chronological order.
-	rows, err := tx.Query(ctx, `SELECT r.prompt, COALESCE(final.event->>'text', '') FROM agent_runs r
-		CROSS JOIN LATERAL (SELECT event FROM run_events WHERE run_id = r.id ORDER BY seq DESC LIMIT 1) final
+	rows, err := tx.Query(ctx, `SELECT r.prompt,
+		ARRAY(SELECT body FROM run_assistant_messages(r.id) ORDER BY seq DESC) FROM agent_runs r
 		WHERE r.conversation_id = $1 AND r.ordinal < $2 AND r.status = $3
 		ORDER BY r.ordinal DESC LIMIT 49`, chat, before, Succeeded.String())
 	if err != nil {
@@ -236,15 +236,22 @@ func chatHistory(ctx context.Context, tx pgx.Tx, chat string, before int64) ([]a
 	var history []agent.Message
 	var size int
 	for rows.Next() {
-		var prompt, answer string
-		if err := rows.Scan(&prompt, &answer); err != nil {
+		var prompt string
+		var messages []string
+		if err := rows.Scan(&prompt, &messages); err != nil {
 			return nil, err
 		}
-		size += len(prompt) + len(answer)
+		size += len(prompt)
+		for _, message := range messages {
+			size += len(message)
+		}
 		if size > 128<<10 {
 			break
 		}
-		history = append(history, agent.Message{Role: agent.RoleAssistant, Text: answer}, agent.Message{Role: agent.RoleUser, Text: prompt})
+		for _, message := range messages {
+			history = append(history, agent.Message{Role: agent.RoleAssistant, Text: message})
+		}
+		history = append(history, agent.Message{Role: agent.RoleUser, Text: prompt})
 	}
 	slices.Reverse(history)
 	return history, rows.Err()

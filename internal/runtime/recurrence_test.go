@@ -71,7 +71,7 @@ func TestRecurringSchedulesPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := json.Marshal(executor.Input{Workflow: executor.RecurringWorkflowName, Skills: catalog, Prompt: "source"})
+	raw, err := json.Marshal(executor.Input{Workflow: executor.DiscoveryWorkflowName, Skills: catalog, Prompt: "source"})
 	if err != nil {
 		t.Fatal(err)
 	}

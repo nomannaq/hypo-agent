@@ -1,7 +1,9 @@
 import { Head, router } from '@inertiajs/react';
 import { Telescope } from 'lucide-react';
 import { motion, useAnimationFrame, useMotionValue } from 'motion/react';
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
+import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
     Message,
     MessageContent,
@@ -84,6 +86,8 @@ const toolLabel = (call: ToolCall, done: boolean) => {
         browser_wait: [`Waiting for “${a.text}”`, `Waited for “${a.text}”`],
         browser_screenshot: ['Taking a screenshot', 'Took a screenshot'],
         todo_write: ['Updating the plan', 'Updated the plan'],
+        send_message: ['Sending a message', 'Sent a message'],
+        search_tools: ['Looking up tools', 'Looked up tools'],
         ask_user: ['Asking you', 'Asked you'],
         read_skill: ['Loading a skill', 'Loaded a skill'],
         schedule: ['Scheduling a task', 'Scheduled a task'],
@@ -112,6 +116,7 @@ type AgentEvent = {
         | 'approval_requested'
         | 'approval_decided';
     text?: string;
+    assistant_message?: string;
     tool_calls?: ToolCall[];
     call_id?: string;
     is_error?: boolean;
@@ -122,7 +127,8 @@ type AgentEvent = {
 type Turn = {
     id: number;
     from: 'user' | 'assistant';
-    text: string; // the prompt, or the final reply once the run ends
+    text: string; // prompt, error, or a legacy saved reply
+    messages?: string[];
     runId?: string;
     events?: AgentEvent[];
     status?: 'working' | 'done' | 'error';
@@ -154,7 +160,8 @@ const loadTurns = (): Turn[] => {
 type StoredRun = {
     id: string;
     prompt: string;
-    reply: string;
+    messages: string[];
+    failure: string;
     status: 'queued' | 'starting' | 'running' | 'succeeded' | 'failed';
     scheduled?: boolean;
 };
@@ -175,7 +182,8 @@ const restoreRuns = (runs: StoredRun[]): Turn[] =>
         {
             id: i * 2 + 1,
             from: 'assistant',
-            text: run.reply,
+            text: run.failure,
+            messages: run.messages,
             runId: run.id,
             status:
                 run.status === 'succeeded'
@@ -185,6 +193,48 @@ const restoreRuns = (runs: StoredRun[]): Turn[] =>
                       : 'working',
         },
     ]);
+
+const assistantMessages = (turn: Turn) =>
+    turn.messages ?? (turn.status === 'done' && turn.text ? [turn.text] : []);
+
+function AssistantMarkdown({ text }: { text: string }) {
+    return (
+        <div className="w-full min-w-0 text-sm leading-7 wrap-anywhere [&_:is(h1,h2,h3,h4,h5,h6)]:font-semibold [&_a]:underline [&_a]:underline-offset-4 [&_blockquote]:border-s-2 [&_blockquote]:ps-4 [&_blockquote]:text-muted-foreground [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_h1]:text-xl [&_h2]:text-lg [&_h3]:text-base [&_ol]:list-decimal [&_ol]:ps-6 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-muted [&_pre]:p-3 [&_pre_code]:p-0 [&_td]:border [&_td]:px-3 [&_th]:border [&_th]:bg-muted [&_th]:px-3 [&_ul]:list-disc [&_ul]:ps-6 [&>*+*]:mt-3">
+            <Markdown
+                remarkPlugins={[remarkGfm]}
+                skipHtml
+                disallowedElements={['img']}
+                components={{
+                    a: ({ href, children }) =>
+                        href ? (
+                            <a
+                                href={href}
+                                target={
+                                    /^https?:\/\/|^\/\//i.test(href)
+                                        ? '_blank'
+                                        : undefined
+                                }
+                                rel="noopener noreferrer"
+                            >
+                                {children}
+                            </a>
+                        ) : (
+                            children
+                        ),
+                    table: ({ children }) => (
+                        <div className="overflow-x-auto">
+                            <table className="border-collapse">
+                                {children}
+                            </table>
+                        </div>
+                    ),
+                }}
+            >
+                {text}
+            </Markdown>
+        </div>
+    );
+}
 
 const startRun = async (
     request: { deep_research: boolean } & (
@@ -486,18 +536,17 @@ function Chat({
             es.close();
             open.delete(es);
         };
-        update(replyId, (t) => ({ ...t, events: [] }));
+        update(replyId, (t) => ({ ...t, events: [], messages: [] }));
         es.onmessage = (m) => {
             const e = JSON.parse(m.data) as AgentEvent;
             update(replyId, (t) => ({
                 ...t,
                 events: [...(t.events ?? []), e],
+                messages: e.assistant_message
+                    ? [...(t.messages ?? []), e.assistant_message]
+                    : t.messages,
                 text:
-                    e.kind === 'model_reply' && !e.tool_calls?.length
-                        ? (e.text ?? '')
-                        : e.kind === 'failed'
-                          ? `The run stopped: ${e.err}`
-                          : t.text,
+                    e.kind === 'failed' ? `The run stopped: ${e.err}` : t.text,
             }));
         };
         es.addEventListener('end', () => {
@@ -569,16 +618,18 @@ function Chat({
                           deep_research: deepResearch,
                           messages: [
                               ...turns
-                                  .filter(
-                                      (t) =>
-                                          (t.from === 'user' ||
-                                              t.status === 'done') &&
-                                          t.text,
+                                  .flatMap((t) =>
+                                      (t.from === 'user'
+                                          ? [t.text]
+                                          : t.status === 'done'
+                                            ? assistantMessages(t)
+                                            : []
+                                      ).map((content) => ({
+                                          role: t.from,
+                                          content,
+                                      })),
                                   )
-                                  .map((t) => ({
-                                      role: t.from,
-                                      content: t.text,
-                                  })),
+                                  .slice(-99),
                               { role: 'user', content: text },
                           ],
                       }
@@ -651,168 +702,215 @@ function Chat({
                         >
                             <MessageGroup spacing="default">
                                 {turns.map((turn) => (
-                                    <Message
-                                        key={turn.id}
-                                        id={turn.runId}
-                                        from={turn.from}
-                                        animateIn
-                                    >
-                                        {turn.from === 'user' ? (
-                                            <MessageBubble variant="solid">
-                                                <MessageBubbleContent>
-                                                    {turn.text}
-                                                </MessageBubbleContent>
-                                            </MessageBubble>
-                                        ) : (
-                                            <MessageContent className="flex flex-col gap-2">
-                                                <AgentActivity
-                                                    items={activityItems(
-                                                        turn.events ?? [],
-                                                        turn.status ===
-                                                            'working',
-                                                    )}
-                                                    status={
-                                                        turn.status ===
-                                                        'working'
-                                                            ? 'working'
-                                                            : 'complete'
-                                                    }
-                                                    duration={turn.seconds ?? 0}
-                                                />
-                                                {latestTodos(turn.events ?? [])
-                                                    .length > 0 && (
-                                                    <TodoList
-                                                        items={latestTodos(
-                                                            turn.events ?? [],
-                                                        )}
-                                                        title="Plan"
-                                                        defaultOpen
-                                                    />
-                                                )}
-                                                {userRequests(
-                                                    turn.events ?? [],
-                                                ).map((req) => {
-                                                    const { call, decided } =
-                                                        req;
-                                                    const key = `${turn.runId}/${call.id}`;
-                                                    const sending =
-                                                        !decided &&
-                                                        deciding.has(key);
-                                                    if (
-                                                        call.name === 'ask_user'
-                                                    ) {
-                                                        const a = (call.args ??
-                                                            {}) as {
-                                                            question?: string;
-                                                            options?: string[];
-                                                        };
-                                                        return (
-                                                            <QuestionCard
-                                                                key={key}
-                                                                question={
-                                                                    a.question ??
-                                                                    ''
-                                                                }
-                                                                options={
-                                                                    a.options
-                                                                }
-                                                                status={
-                                                                    !decided
-                                                                        ? sending
-                                                                            ? 'sending'
-                                                                            : 'pending'
-                                                                        : decided.approved
-                                                                          ? 'answered'
-                                                                          : 'skipped'
-                                                                }
-                                                                answer={
-                                                                    decided?.text
-                                                                }
-                                                                onAnswer={(
-                                                                    answer,
-                                                                ) =>
-                                                                    decide(
-                                                                        turn.runId!,
-                                                                        call.id,
-                                                                        true,
-                                                                        answer,
-                                                                    )
-                                                                }
-                                                                onSkip={() =>
-                                                                    decide(
-                                                                        turn.runId!,
-                                                                        call.id,
-                                                                        false,
-                                                                    )
-                                                                }
-                                                            />
-                                                        );
-                                                    }
-                                                    const status =
-                                                        approvalStatus(req);
-                                                    return (
-                                                        <ToolApproval
-                                                            key={key}
-                                                            tool={call.name}
-                                                            description={
-                                                                call.name ===
-                                                                'remember'
-                                                                    ? 'Save this information for future chats.'
-                                                                    : call.name ===
-                                                                        'schedule'
-                                                                      ? 'Run this task on the approved schedule and deliver results in this chat.'
-                                                                      : 'Allow the agent to perform this action.'
-                                                            }
-                                                            parameters={approvalParameters(
-                                                                call,
+                                    <Fragment key={turn.id}>
+                                        {turn.from === 'user' ||
+                                        turn.events?.length ||
+                                        turn.status !== 'done' ||
+                                        !assistantMessages(turn).length ? (
+                                            <Message
+                                                id={turn.runId}
+                                                from={turn.from}
+                                                animateIn
+                                            >
+                                                {turn.from === 'user' ? (
+                                                    <MessageBubble variant="solid">
+                                                        <MessageBubbleContent>
+                                                            {turn.text}
+                                                        </MessageBubbleContent>
+                                                    </MessageBubble>
+                                                ) : (
+                                                    <MessageContent className="flex flex-col gap-2">
+                                                        <AgentActivity
+                                                            items={activityItems(
+                                                                turn.events ??
+                                                                    [],
+                                                                turn.status ===
+                                                                    'working',
                                                             )}
-                                                            defaultOpen
                                                             status={
-                                                                status ===
-                                                                    'pending' &&
-                                                                sending
-                                                                    ? 'approving'
-                                                                    : status
+                                                                turn.status ===
+                                                                'working'
+                                                                    ? 'working'
+                                                                    : 'complete'
                                                             }
-                                                            onApprove={() =>
-                                                                decide(
-                                                                    turn.runId!,
-                                                                    call.id,
-                                                                    true,
-                                                                )
-                                                            }
-                                                            onDeny={() =>
-                                                                decide(
-                                                                    turn.runId!,
-                                                                    call.id,
-                                                                    false,
-                                                                )
+                                                            duration={
+                                                                turn.seconds ??
+                                                                0
                                                             }
                                                         />
-                                                    );
-                                                })}
-                                                {screenshots(
-                                                    turn.events ?? [],
-                                                ).map((id) => (
-                                                    <a
-                                                        key={id}
-                                                        href={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
-                                                        target="_blank"
-                                                        rel="noreferrer"
+                                                        {latestTodos(
+                                                            turn.events ?? [],
+                                                        ).length > 0 && (
+                                                            <TodoList
+                                                                items={latestTodos(
+                                                                    turn.events ??
+                                                                        [],
+                                                                )}
+                                                                title="Plan"
+                                                                defaultOpen
+                                                            />
+                                                        )}
+                                                        {userRequests(
+                                                            turn.events ?? [],
+                                                        ).map((req) => {
+                                                            const {
+                                                                call,
+                                                                decided,
+                                                            } = req;
+                                                            const key = `${turn.runId}/${call.id}`;
+                                                            const sending =
+                                                                !decided &&
+                                                                deciding.has(
+                                                                    key,
+                                                                );
+                                                            if (
+                                                                call.name ===
+                                                                'ask_user'
+                                                            ) {
+                                                                const a =
+                                                                    (call.args ??
+                                                                        {}) as {
+                                                                        question?: string;
+                                                                        options?: string[];
+                                                                    };
+                                                                return (
+                                                                    <QuestionCard
+                                                                        key={
+                                                                            key
+                                                                        }
+                                                                        question={
+                                                                            a.question ??
+                                                                            ''
+                                                                        }
+                                                                        options={
+                                                                            a.options
+                                                                        }
+                                                                        status={
+                                                                            !decided
+                                                                                ? sending
+                                                                                    ? 'sending'
+                                                                                    : 'pending'
+                                                                                : decided.approved
+                                                                                  ? 'answered'
+                                                                                  : 'skipped'
+                                                                        }
+                                                                        answer={
+                                                                            decided?.text
+                                                                        }
+                                                                        onAnswer={(
+                                                                            answer,
+                                                                        ) =>
+                                                                            decide(
+                                                                                turn.runId!,
+                                                                                call.id,
+                                                                                true,
+                                                                                answer,
+                                                                            )
+                                                                        }
+                                                                        onSkip={() =>
+                                                                            decide(
+                                                                                turn.runId!,
+                                                                                call.id,
+                                                                                false,
+                                                                            )
+                                                                        }
+                                                                    />
+                                                                );
+                                                            }
+                                                            const status =
+                                                                approvalStatus(
+                                                                    req,
+                                                                );
+                                                            return (
+                                                                <ToolApproval
+                                                                    key={key}
+                                                                    tool={
+                                                                        call.name
+                                                                    }
+                                                                    description={
+                                                                        call.name ===
+                                                                        'remember'
+                                                                            ? 'Save this information for future chats.'
+                                                                            : call.name ===
+                                                                                'schedule'
+                                                                              ? 'Run this task on the approved schedule and deliver results in this chat.'
+                                                                              : 'Allow the agent to perform this action.'
+                                                                    }
+                                                                    parameters={approvalParameters(
+                                                                        call,
+                                                                    )}
+                                                                    defaultOpen
+                                                                    status={
+                                                                        status ===
+                                                                            'pending' &&
+                                                                        sending
+                                                                            ? 'approving'
+                                                                            : status
+                                                                    }
+                                                                    onApprove={() =>
+                                                                        decide(
+                                                                            turn.runId!,
+                                                                            call.id,
+                                                                            true,
+                                                                        )
+                                                                    }
+                                                                    onDeny={() =>
+                                                                        decide(
+                                                                            turn.runId!,
+                                                                            call.id,
+                                                                            false,
+                                                                        )
+                                                                    }
+                                                                />
+                                                            );
+                                                        })}
+                                                        {screenshots(
+                                                            turn.events ?? [],
+                                                        ).map((id) => (
+                                                            <a
+                                                                key={id}
+                                                                href={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
+                                                                target="_blank"
+                                                                rel="noreferrer"
+                                                            >
+                                                                <img
+                                                                    src={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
+                                                                    alt="Screenshot of the page the agent was on"
+                                                                    className="max-h-96 rounded-lg border"
+                                                                    loading="lazy"
+                                                                />
+                                                            </a>
+                                                        ))}
+                                                        {turn.status ===
+                                                            'error' &&
+                                                            turn.text}
+                                                    </MessageContent>
+                                                )}
+                                            </Message>
+                                        ) : null}
+                                        {turn.from === 'assistant' &&
+                                            assistantMessages(turn).map(
+                                                (text, index) => (
+                                                    <Message
+                                                        key={index}
+                                                        id={
+                                                            index === 0 &&
+                                                            turn.status ===
+                                                                'done' &&
+                                                            !turn.events?.length
+                                                                ? turn.runId
+                                                                : undefined
+                                                        }
+                                                        from="assistant"
+                                                        animateIn
                                                     >
-                                                        <img
-                                                            src={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
-                                                            alt="Screenshot of the page the agent was on"
-                                                            className="max-h-96 rounded-lg border"
-                                                            loading="lazy"
+                                                        <AssistantMarkdown
+                                                            text={text}
                                                         />
-                                                    </a>
-                                                ))}
-                                                {turn.status !== 'working' &&
-                                                    turn.text}
-                                            </MessageContent>
-                                        )}
-                                    </Message>
+                                                    </Message>
+                                                ),
+                                            )}
+                                    </Fragment>
                                 ))}
                             </MessageGroup>
                         </MessageScroller>

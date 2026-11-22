@@ -48,6 +48,7 @@ func runtimeTestDB(t *testing.T, migrations ...string) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	base := []string{"20261119191023_create_users.sql", "20261120223657_create_run_events.sql", "20261122004308_durable_conversations.sql"}
+	base = append(base, "20261122014500_assistant_messages.sql")
 	for _, name := range append(base, migrations...) {
 		sql, err := db.Migrations.ReadFile("migrations/" + name)
 		if err != nil {
@@ -138,13 +139,28 @@ func TestSchedulerPostgres(t *testing.T) {
 
 	// A terminal append can win against the start acknowledgement. Its
 	// output becomes the follow-up's history exactly once.
+	events := []agent.Event{
+		{Kind: agent.UserMessage, Text: "first prompt"},
+		{Kind: agent.ModelReply, Text: "opening update", ToolCalls: []agent.ToolCall{{ID: "same", Name: "send_message"}, {ID: "bad", Name: "send_message"}}},
+		{Kind: agent.ToolResult, CallID: "same", Text: "**Standalone update**"},
+		{Kind: agent.ToolResult, CallID: "bad", Text: "validation error", IsError: true},
+		{Kind: agent.ModelReply, Text: "\n\t", ToolCalls: []agent.ToolCall{{ID: "same", Name: "search_tools"}}},
+		{Kind: agent.ToolResult, CallID: "same", Text: "internal tool discovery results"},
+		{Kind: agent.ModelReply, ToolCalls: []agent.ToolCall{{ID: "ambiguous", Name: "browse"}, {ID: "ambiguous", Name: "send_message"}}},
+		{Kind: agent.ToolResult, CallID: "ambiguous", Text: "ambiguous result"},
+		{Kind: agent.ModelReply, Text: "first reply"},
+	}
 	for range 2 {
-		if err := s.AppendEvent(ctx, "first", 0, agent.Event{Kind: agent.UserMessage, Text: "first prompt"}); err != nil {
-			t.Fatal(err)
+		for seq, event := range events {
+			if err := s.AppendEvent(ctx, "first", seq, event); err != nil {
+				t.Fatal(err)
+			}
 		}
-		if err := s.AppendEvent(ctx, "first", 1, agent.Event{Kind: agent.ModelReply, Text: "first reply"}); err != nil {
-			t.Fatal(err)
-		}
+	}
+	var resumed []string
+	if err := pool.QueryRow(ctx, `SELECT ARRAY(SELECT body FROM run_assistant_messages('first', 2) ORDER BY seq)`).Scan(&resumed); err != nil ||
+		len(resumed) != 2 || resumed[0] != "**Standalone update**" || resumed[1] != "first reply" {
+		t.Fatalf("resumed messages = %q, %v", resumed, err)
 	}
 	if err := s.advance(ctx, "first", Starting, WorkflowStarted, ""); err != nil {
 		t.Fatal(err)
@@ -154,8 +170,10 @@ func TestSchedulerPostgres(t *testing.T) {
 		t.Fatalf("follow-up claim = %q, %v", id, err)
 	}
 	var follow executor.Input
-	if err := json.Unmarshal(input, &follow); err != nil || len(follow.History) != 2 ||
-		follow.History[1].Text != "first reply" || follow.Prompt != "follow up" || follow.Workflow != executor.SkillsWorkflowName || follow.Skills == nil || follow.Skills.Digest != catalog.Digest {
+	if err := json.Unmarshal(input, &follow); err != nil || len(follow.History) != 4 ||
+		follow.History[0].Text != "first prompt" || follow.History[1].Text != "opening update" ||
+		follow.History[2].Text != "**Standalone update**" || follow.History[3].Text != "first reply" ||
+		follow.Prompt != "follow up" || follow.Workflow != executor.SkillsWorkflowName || follow.Skills == nil || follow.Skills.Digest != catalog.Digest {
 		t.Fatalf("follow-up input = %+v, %v", follow, err)
 	}
 

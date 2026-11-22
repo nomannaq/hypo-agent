@@ -48,7 +48,7 @@ func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
 	}
 	req := runtime.Request{
 		ID: "run-" + rand.Text(), Owner: currentUser(r).ID, RequestID: in.RequestID,
-		Input: executor.Input{Workflow: executor.RecurringWorkflowName, Skills: s.skills},
+		Input: executor.Input{Workflow: executor.DiscoveryWorkflowName, Skills: s.skills},
 	}
 	if in.DeepResearch {
 		req.Input.Workflow = executor.DeepResearchWorkflowV2
@@ -112,7 +112,7 @@ func (s *server) startWorkflow(ctx context.Context, id string, input []byte) err
 	switch workflowName {
 	case "":
 		workflowName = executor.WorkflowName
-	case executor.MemoryWorkflowName, executor.SkillsWorkflowName, executor.SchedulingWorkflowName, executor.ScheduledWorkflowName, executor.RecurringWorkflowName, executor.DeepResearchWorkflowName, executor.DeepResearchWorkflowV2:
+	case executor.MemoryWorkflowName, executor.SkillsWorkflowName, executor.SchedulingWorkflowName, executor.ScheduledWorkflowName, executor.RecurringWorkflowName, executor.MessagingWorkflowName, executor.DiscoveryWorkflowName, executor.DeepResearchWorkflowName, executor.DeepResearchWorkflowV2:
 	default:
 		return fmt.Errorf("unknown workflow type %q", workflowName)
 	}
@@ -266,7 +266,9 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		checkRun = false
 
-		rows, err := s.db.Query(ctx, `SELECT seq, event FROM run_events WHERE run_id = $1 AND seq >= $2 ORDER BY seq`, id, next)
+		rows, err := s.db.Query(ctx, `SELECT e.seq, e.event, COALESCE(m.body, '')
+			FROM run_events e LEFT JOIN run_assistant_messages($1, $2) m USING (seq)
+			WHERE e.run_id = $1 AND e.seq >= $2 ORDER BY e.seq`, id, next)
 		if err != nil {
 			log.Printf("run %s: reading events: %v", id, err)
 			return
@@ -274,7 +276,8 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var seq int
 			var e agent.Event
-			if err := rows.Scan(&seq, &e); err != nil || seq != next {
+			var message string
+			if err := rows.Scan(&seq, &e, &message); err != nil || seq != next {
 				break // a bad row or a gap: stop here and read again on the next wake
 			}
 			if st, err = agent.Reduce(st, e); err != nil {
@@ -284,7 +287,10 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			next++
 			if seq > after {
-				data, _ := json.Marshal(e)
+				data, _ := json.Marshal(struct {
+					agent.Event
+					AssistantMessage string `json:"assistant_message,omitempty"`
+				}{e, message})
 				fmt.Fprintf(w, "id: %d\ndata: %s\n\n", seq, data)
 			}
 		}
