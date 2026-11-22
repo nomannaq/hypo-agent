@@ -532,3 +532,45 @@ func TestRecallSnapshotIsJournaled(t *testing.T) {
 		t.Fatalf("lookup called %d times across replay", lookups.Load())
 	}
 }
+
+// A model stuck on the same empty search is told so, without blocking it.
+func TestRepeatedCallsAreNudged(t *testing.T) {
+	search := tool.Typed("web_search", "search", `{"type":"object"}`, func(_ context.Context, in struct{ Query string }) (string, error) {
+		if in.Query == "fresh" {
+			return "1. A result", nil
+		}
+		return fmt.Sprintf("No results for %q.", in.Query), nil
+	})
+	same := func(id, args string) model.Response {
+		return model.Response{ToolCalls: []model.ToolCall{toolCall(id, "web_search", args)}}
+	}
+	m := &scripted{replies: []model.Response{
+		same("a", `{"query":"cdp roi"}`),
+		same("b", `{"query":"cdp roi"}`),
+		same("c", `{ "query": "cdp roi" }`), // spacing doesn't make it a new call
+		same("d", `{"query":"other"}`),
+		same("e", `{"query":"fresh"}`),
+		{Content: "done"},
+	}}
+	s, err := run(t, memkernel.New(), &Runner{Model: m, Tools: tool.Registry{search}}, "r1", "find it")
+	if err != nil || s.Status != agent.Done {
+		t.Fatalf("run = %v, %v", s.Status, err)
+	}
+	notes := map[string][2]bool{}
+	for _, msg := range s.Messages {
+		if msg.Role == agent.RoleTool {
+			notes[msg.CallID] = [2]bool{strings.Contains(msg.Text, "identical web_search call"), strings.Contains(msg.Text, "searches in a row found nothing")}
+		}
+	}
+	want := map[string][2]bool{
+		"a": {false, false}, "b": {false, false},
+		"c": {true, true},  // third identical call, third empty search
+		"d": {false, true}, // new query, still a fourth empty search
+		"e": {false, false},
+	}
+	for id, w := range want {
+		if notes[id] != w {
+			t.Errorf("call %s notes (repeat, empty) = %v, want %v", id, notes[id], w)
+		}
+	}
+}

@@ -325,6 +325,12 @@ Tool failures (unknown tool, malformed arguments, handler error, timeout) go
 back to the model as an error result so it can recover; they don't end the
 run.
 
+A model stuck in a loop gets a note on the tool result, never a block
+(`nudge`): from the third identical call in a row (same tool, same
+arguments after JSON compaction), and from the third `web_search` in a row
+that found nothing or failed. Notes are computed from the run's messages and
+add no journaled calls, so replay is unaffected.
+
 ## Tools
 
 `internal/tool.Registry` is a slice of `tool.Tool` (name, description, JSON
@@ -586,6 +592,9 @@ Apply the lane migrations before deploying the server and workers.
 at Nebius Token Factory. `Complete` supports tool calling, retries network
 errors, 429s and 5xx with exponential backoff and full jitter (honouring
 `Retry-After`), and calls `OnUsage` once per successful call for metering.
+A response with no choices is retried like a 5xx. A blank reply (no text,
+no tool calls) is retried once; a second blank is returned as is, so callers
+keep their own recovery.
 `Chat` is `Complete` without tools. The default model is
 `deepseek-ai/DeepSeek-V4.1-Flash-1017`; override with `NEBIUS_MODEL`.
 

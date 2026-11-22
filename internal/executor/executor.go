@@ -5,6 +5,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -583,6 +584,7 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 					return s, err
 				}
 			}
+			res = nudge(s, call, res)
 			if err := apply(agent.Event{Kind: agent.ToolResult, CallID: call.ID, Text: res.Output, IsError: res.IsError}); err != nil {
 				return s, err
 			}
@@ -591,6 +593,77 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 			return s, fmt.Errorf("executor: unexpected status %q", s.Status)
 		}
 	}
+}
+
+// nudge tells a model that keeps repeating itself that the result won't
+// change. It never blocks a call. It reads only the run's messages and adds
+// no journaled calls, so replay is unaffected.
+func nudge(s agent.State, call agent.ToolCall, res toolResult) toolResult {
+	if n := repeats(s, call); n >= 3 {
+		res.Output += fmt.Sprintf("\n\n[Note: this is identical %s call %d in a row; its result won't change. Try a different approach, or answer with what you have.]", call.Name, n)
+	}
+	if call.Name == "web_search" && emptySearch(res.Output) {
+		if n := emptySearches(s) + 1; n >= 3 {
+			res.Output += fmt.Sprintf("\n\n[Note: %d searches in a row found nothing, so search may be unavailable. Try one different query or browse a URL you know, then answer with what you have and say what you couldn't verify.]", n)
+		}
+	}
+	return res
+}
+
+// repeats counts the calls identical to call (same tool and arguments) in an
+// unbroken run that ends with call, which is s.Pending[0].
+func repeats(s agent.State, call agent.ToolCall) int {
+	var calls []agent.ToolCall
+	for i, m := range s.Messages {
+		calls = append(calls, m.ToolCalls...)
+		if m.Role == agent.RoleAssistant && len(m.ToolCalls) > 0 && slices.IndexFunc(s.Messages[i+1:], func(later agent.Message) bool {
+			return later.Role == agent.RoleAssistant
+		}) == -1 {
+			calls = calls[:len(calls)-len(s.Pending)] // drop this reply's unprocessed calls, including call
+			break
+		}
+	}
+	n := 1
+	for i := len(calls) - 1; i >= 0 && sameCall(calls[i], call); i-- {
+		n++
+	}
+	return n
+}
+
+func sameCall(a, b agent.ToolCall) bool {
+	if a.Name != b.Name {
+		return false
+	}
+	var ca, cb bytes.Buffer
+	if json.Compact(&ca, a.Args) != nil || json.Compact(&cb, b.Args) != nil {
+		return bytes.Equal(a.Args, b.Args)
+	}
+	return bytes.Equal(ca.Bytes(), cb.Bytes())
+}
+
+func emptySearch(output string) bool {
+	return strings.HasPrefix(output, "No results for") || strings.HasPrefix(output, "search unavailable")
+}
+
+// emptySearches counts the web_search results that found nothing since the
+// last one that did.
+func emptySearches(s agent.State) int {
+	names := map[string]string{}
+	n := 0
+	for _, m := range s.Messages {
+		for _, tc := range m.ToolCalls {
+			names[tc.ID] = tc.Name
+		}
+		if m.Role != agent.RoleTool || names[m.CallID] != "web_search" {
+			continue
+		}
+		if emptySearch(m.Text) {
+			n++
+		} else {
+			n = 0
+		}
+	}
+	return n
 }
 
 func isWebRead(name string) bool {

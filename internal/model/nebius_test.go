@@ -100,6 +100,35 @@ func TestCompleteDoesNotRetryClientErrors(t *testing.T) {
 	}
 }
 
+// A reply with no choices is transient; a blank reply gets exactly one retry
+// and, if still blank, reaches the caller as a blank Response.
+func TestCompleteRetriesEmptyAndBlankReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		replies []string
+		want    string
+		hits    int32
+	}{
+		{"no choices", []string{`{"choices":[]}`, `{"choices":[{"message":{"content":"ok"}}]}`}, "ok", 2},
+		{"blank then answer", []string{`{"choices":[{"message":{"content":" \n"}}]}`, `{"choices":[{"message":{"content":"ok"}}]}`}, "ok", 2},
+		{"blank twice", []string{`{"choices":[{"message":{"content":""}}]}`, `{"choices":[{"message":{"content":""}}]}`, `{"choices":[{"message":{"content":"never"}}]}`}, "", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.replies[hits.Add(1)-1]))
+			}))
+			defer srv.Close()
+			c := NewClient("key", srv.URL, "m")
+			c.RetryBase = time.Millisecond
+			resp, err := c.Complete(t.Context(), Request{})
+			if err != nil || resp.Content != tc.want || hits.Load() != tc.hits {
+				t.Fatalf("content %q, %d attempts, %v; want %q in %d", resp.Content, hits.Load(), err, tc.want, tc.hits)
+			}
+		})
+	}
+}
+
 // TestSmokeNebius calls the real API. It is skipped unless the key is set:
 //
 //	make smoke

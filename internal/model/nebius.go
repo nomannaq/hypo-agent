@@ -128,11 +128,20 @@ func (c *Client) Complete(ctx context.Context, req Request) (Response, error) {
 		return Response{}, err
 	}
 
+	retriedBlank := false
 	for attempt := 0; ; attempt++ {
 		resp, retryAfter, err := c.do(ctx, body)
 		if err == nil {
 			if c.OnUsage != nil {
 				c.OnUsage(c.Model, resp.Usage)
+			}
+			// A blank reply is often a reasoning model spending its whole
+			// budget thinking. One retry usually answers; more would double
+			// the cost each time. A second blank goes to the caller, whose
+			// own recovery (a shorter brief, a fallback) handles it.
+			if strings.TrimSpace(resp.Content) == "" && len(resp.ToolCalls) == 0 && !retriedBlank {
+				retriedBlank = true
+				continue
 			}
 			return resp, nil
 		}
@@ -195,7 +204,7 @@ func (c *Client) do(ctx context.Context, body []byte) (Response, time.Duration, 
 		return Response{}, 0, fmt.Errorf("model: decoding response: %w", err)
 	}
 	if len(out.Choices) == 0 {
-		return Response{}, 0, errors.New("model: empty response")
+		return Response{}, 0, &retryable{errors.New("model: response had no choices")}
 	}
 	m := out.Choices[0].Message
 	return Response{Content: m.Content, ToolCalls: m.ToolCalls, Usage: out.Usage}, 0, nil
