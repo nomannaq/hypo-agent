@@ -1,7 +1,7 @@
 import { Head, router } from '@inertiajs/react';
 import { Telescope } from 'lucide-react';
 import { motion, useAnimationFrame, useMotionValue } from 'motion/react';
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -28,7 +28,7 @@ import { MessageScroller } from '@/components/agents/message-scroller';
 import { PromptInput } from '@/components/agents/prompt-input';
 import { VoiceOrb } from '@/components/agents/voice-orb';
 import { SPRING_LAYOUT } from '@/lib/ease';
-import { agent, agentChat } from '@/routes';
+import { agent, agentChat, cancelRun } from '@/routes';
 
 type ToolCall = { id: string; name: string; args?: unknown };
 
@@ -57,7 +57,7 @@ const toolLabel = (call: ToolCall, done: boolean) => {
     const labels: Record<string, [string, string]> = {
         deep_research_plan: ['Planning the research', 'Planned the research'],
         deep_research_collect: [
-            'Searching for sources in parallel',
+            'Searching for sources',
             'Collected initial evidence',
         ],
         deep_research_investigate: [
@@ -86,7 +86,6 @@ const toolLabel = (call: ToolCall, done: boolean) => {
         browser_wait: [`Waiting for “${a.text}”`, `Waited for “${a.text}”`],
         browser_screenshot: ['Taking a screenshot', 'Took a screenshot'],
         todo_write: ['Updating the plan', 'Updated the plan'],
-        send_message: ['Sending a message', 'Sent a message'],
         search_tools: ['Looking up tools', 'Looked up tools'],
         ask_user: ['Asking you', 'Asked you'],
         read_skill: ['Loading a skill', 'Loaded a skill'],
@@ -95,7 +94,7 @@ const toolLabel = (call: ToolCall, done: boolean) => {
         recall: ['Searching saved memories', 'Searched saved memories'],
         session_search: ['Searching past chats', 'Searched past chats'],
         research: [
-            `Researching ${a.tasks?.length ?? ''} topics in parallel`,
+            `Researching ${a.tasks?.length ?? ''} topics`,
             `Researched ${(a.tasks ?? []).map((t) => t.title).join(', ')}`,
         ],
     };
@@ -117,11 +116,19 @@ type AgentEvent = {
         | 'approval_decided';
     text?: string;
     assistant_message?: string;
+    seq?: number;
     tool_calls?: ToolCall[];
     call_id?: string;
     is_error?: boolean;
     approved?: boolean;
     err?: string;
+};
+
+type RunLifecycle = {
+    status: StoredRun['status'];
+    background_research: boolean;
+    cancel_requested: boolean;
+    waiting_for?: 'capacity';
 };
 
 type Turn = {
@@ -130,6 +137,11 @@ type Turn = {
     text: string; // prompt, error, or a legacy saved reply
     messages?: string[];
     runId?: string;
+    deepResearch?: boolean;
+    backgroundResearch?: boolean;
+    lifecycle?: RunLifecycle;
+    cancelling?: boolean;
+    retryPrompt?: string;
     events?: AgentEvent[];
     status?: 'queued' | 'working' | 'done' | 'error';
     seconds?: number; // how long the run took
@@ -162,10 +174,12 @@ const loadTurns = (): Turn[] => {
 type StoredRun = {
     id: string;
     prompt: string;
-    messages: string[];
+    events: AgentEvent[];
     failure: string;
     status: 'queued' | 'starting' | 'running' | 'succeeded' | 'failed';
     scheduled?: boolean;
+    deep_research?: boolean;
+    background_research?: boolean;
 };
 
 type AgentProps = {
@@ -185,8 +199,11 @@ const restoreRuns = (runs: StoredRun[]): Turn[] =>
             id: i * 2 + 1,
             from: 'assistant',
             text: run.failure,
-            messages: run.messages,
+            events: run.events,
             runId: run.id,
+            deepResearch: run.deep_research,
+            backgroundResearch: run.background_research,
+            retryPrompt: run.scheduled ? undefined : run.prompt,
             status:
                 run.status === 'succeeded'
                     ? 'done'
@@ -198,12 +215,19 @@ const restoreRuns = (runs: StoredRun[]): Turn[] =>
         },
     ]);
 
-const assistantMessages = (turn: Turn) =>
-    turn.messages ?? (turn.status === 'done' && turn.text ? [turn.text] : []);
+const assistantMessages = (turn: Turn) => {
+    const messages = (turn.events ?? []).flatMap((e) =>
+        e.assistant_message ? [e.assistant_message] : [],
+    );
+    return messages.length
+        ? messages
+        : (turn.messages ??
+              (turn.status === 'done' && turn.text ? [turn.text] : []));
+};
 
 function AssistantMarkdown({ text }: { text: string }) {
     return (
-        <div className="w-full min-w-0 text-sm leading-7 wrap-anywhere [&_:is(h1,h2,h3,h4,h5,h6)]:font-semibold [&_a]:underline [&_a]:underline-offset-4 [&_blockquote]:border-s-2 [&_blockquote]:ps-4 [&_blockquote]:text-muted-foreground [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_h1]:text-xl [&_h2]:text-lg [&_h3]:text-base [&_ol]:list-decimal [&_ol]:ps-6 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-muted [&_pre]:p-3 [&_pre_code]:p-0 [&_td]:border [&_td]:px-3 [&_th]:border [&_th]:bg-muted [&_th]:px-3 [&_ul]:list-disc [&_ul]:ps-6 [&>*+*]:mt-3">
+        <div className="assistant-prose">
             <Markdown
                 remarkPlugins={[remarkGfm]}
                 skipHtml
@@ -248,6 +272,7 @@ type ChatFrame =
           conversation_id: string;
       }
     | { type: 'rejected'; request_id: string; error: string }
+    | { type: 'lifecycle'; run_id: string; lifecycle: RunLifecycle }
     | { type: 'event'; run_id: string; seq: number; event: AgentEvent }
     | { type: 'end'; run_id: string }
     | { type: 'error'; run_id: string; error?: string }
@@ -265,26 +290,77 @@ type QueuedPrompt = {
 // approve, and ask_user questions. Each comes with its call, the user's
 // decision once made, and the call's result once it has one.
 type UserRequest = {
+    seq: number;
     call: ToolCall;
     decided?: AgentEvent;
     result?: AgentEvent;
 };
-const userRequests = (events: AgentEvent[]): UserRequest[] => {
+
+type TimelineItem =
+    | { kind: 'message'; seq: number; text: string }
+    | { kind: 'request'; seq: number; request: UserRequest }
+    | { kind: 'plan'; seq: number; items: TodoItem[] }
+    | { kind: 'screenshot'; seq: number; id: string };
+
+const timeline = (turn: Turn): TimelineItem[] => {
+    const items: TimelineItem[] = [];
     const calls = new Map<string, ToolCall>();
-    for (const e of events)
-        for (const c of e.tool_calls ?? []) calls.set(c.id, c);
-    const find = (kind: AgentEvent['kind'], id: string) =>
-        events.find((e) => e.kind === kind && e.call_id === id);
-    return events
-        .filter((e) => e.kind === 'approval_requested' && e.call_id)
-        .map((e) => {
-            const call = calls.get(e.call_id!) ?? { id: e.call_id!, name: '?' };
-            return {
-                call,
-                decided: find('approval_decided', call.id),
-                result: find('tool_result', call.id),
-            };
-        });
+    const requests = new Map<string, UserRequest>();
+    let latestPlan: number | undefined;
+    (turn.events ?? []).forEach((event, index) => {
+        const seq = event.seq ?? index;
+        if (event.assistant_message) {
+            items.push({ kind: 'message', seq, text: event.assistant_message });
+        }
+        if (event.kind === 'model_reply') {
+            calls.clear();
+            requests.clear();
+            for (const call of event.tool_calls ?? []) calls.set(call.id, call);
+        }
+        const id = event.call_id;
+        if (!id) return;
+        const call = calls.get(id);
+        const request = requests.get(id);
+        if (event.kind === 'approval_requested' && call) {
+            const pending = { seq, call };
+            requests.set(id, pending);
+            items.push({ kind: 'request', seq, request: pending });
+        }
+        if (event.kind === 'approval_decided' && request)
+            request.decided = event;
+        if (event.kind !== 'tool_result') return;
+        if (request) request.result = event;
+        if (event.is_error) return;
+        if (call?.name === 'browser_screenshot') {
+            const artifact = event.text
+                ?.trimEnd()
+                .match(/\[artifact:(a-[A-Z2-7]+)\]$/)?.[1];
+            if (artifact) items.push({ kind: 'screenshot', seq, id: artifact });
+        }
+        if (call?.name === 'todo_write') {
+            const args = call.args as
+                { todos?: { content: string; status: string }[] } | undefined;
+            const todos = (args?.todos ?? []).map((todo, index): TodoItem => ({
+                id: String(index),
+                title: todo.content,
+                status:
+                    todo.status === 'in_progress'
+                        ? 'in-progress'
+                        : (todo.status as TodoItem['status']),
+            }));
+            latestPlan = seq;
+            items.push({ kind: 'plan', seq, items: todos });
+        }
+    });
+    if (!items.some((item) => item.kind === 'message')) {
+        // Old tab-local chats may only have saved message strings.
+        assistantMessages(turn).forEach((text, index) =>
+            items.push({ kind: 'message', seq: index, text }),
+        );
+    }
+    return items.filter(
+        (item) => item.kind !== 'plan' || item.seq === latestPlan,
+    );
 };
 
 const approvalStatus = ({
@@ -300,33 +376,6 @@ const approvalStatus = ({
             : result.is_error
               ? 'error'
               : 'complete';
-
-// The latest plan the agent wrote with todo_write.
-const latestTodos = (events: AgentEvent[]): TodoItem[] => {
-    const calls = events.flatMap((e) =>
-        (e.tool_calls ?? []).filter((c) => c.name === 'todo_write'),
-    );
-    const args = calls.at(-1)?.args as
-        { todos?: { content: string; status: string }[] } | undefined;
-    return (args?.todos ?? []).map((t, i) => ({
-        id: String(i),
-        title: t.content,
-        status:
-            t.status === 'in_progress'
-                ? 'in-progress'
-                : (t.status as TodoItem['status']),
-    }));
-};
-
-// Screenshots the run took: browser_screenshot results carry [artifact:ID].
-const screenshots = (events: AgentEvent[]) =>
-    events.flatMap((e) =>
-        e.kind === 'tool_result' && !e.is_error
-            ? [...(e.text ?? '').matchAll(/\[artifact:([\w-]+)\]/g)].map(
-                  (m) => m[1],
-              )
-            : [],
-    );
 
 // What the user is asked to approve, as ToolApproval parameters: the URL,
 // then each form field.
@@ -384,9 +433,6 @@ const activityItems = (
     working: boolean,
 ): AgentActivityItem[] => {
     const items: AgentActivityItem[] = [];
-    const done = new Map<string, AgentEvent>();
-    for (const e of events)
-        if (e.kind === 'tool_result' && e.call_id) done.set(e.call_id, e);
     events.forEach((e, i) => {
         if (e.kind !== 'model_reply') return;
         if (
@@ -401,12 +447,20 @@ const activityItems = (
                 status: 'complete',
             });
         }
+        const next = events.findIndex(
+            (event, index) => index > i && event.kind === 'model_reply',
+        );
+        const batch = events.slice(i + 1, next === -1 ? undefined : next);
         for (const call of e.tool_calls ?? []) {
-            const result = done.get(call.id);
-            const asked = events.some(
+            if (call.name === 'send_message') continue;
+            const result = batch.find(
+                (event) =>
+                    event.kind === 'tool_result' && event.call_id === call.id,
+            );
+            const asked = batch.some(
                 (e) => e.kind === 'approval_requested' && e.call_id === call.id,
             );
-            const answered = events.some(
+            const answered = batch.some(
                 (e) => e.kind === 'approval_decided' && e.call_id === call.id,
             );
             items.push({
@@ -450,14 +504,35 @@ export default function Agent(props: AgentProps) {
 }
 
 function RunActivity({ turn, connected }: { turn: Turn; connected: boolean }) {
-    if (turn.status === 'queued') {
+    if (
+        turn.cancelling ||
+        (turn.lifecycle?.cancel_requested &&
+            turn.status !== 'error' &&
+            turn.status !== 'done')
+    ) {
         return (
             <p role="status" className="text-sm text-muted-foreground">
-                {turn.runId
-                    ? 'Queued'
-                    : connected
-                      ? 'Sending…'
-                      : 'Waiting for connection…'}
+                Stopping…
+            </p>
+        );
+    }
+    const background =
+        turn.lifecycle?.background_research ??
+        (turn.backgroundResearch || turn.deepResearch);
+    if (turn.status === 'queued') {
+        let label = background
+            ? 'Research will start shortly'
+            : 'Queued';
+        if (!turn.runId)
+            label = connected ? 'Sending…' : 'Waiting for connection…';
+        else if (turn.lifecycle?.status === 'starting') label = 'Starting…';
+        else if (turn.lifecycle?.waiting_for === 'capacity')
+            label = background
+                ? 'Research will start when another finishes'
+                : 'Waiting for a chat slot';
+        return (
+            <p role="status" className="text-sm text-muted-foreground">
+                {label}
             </p>
         );
     }
@@ -469,15 +544,25 @@ function RunActivity({ turn, connected }: { turn: Turn; connected: boolean }) {
             item.status === 'active' &&
             item.id.startsWith('tool-'),
     );
+    const substantive = items.some((item) => item.id.startsWith('tool-'));
     return (
-        <AgentActivity
-            items={items}
-            activeLabel={
-                activeTool?.type === 'step' ? activeTool.label : undefined
-            }
-            status={working ? 'working' : 'complete'}
-            duration={turn.seconds ?? 0}
-        />
+        <>
+            {working && (
+                <p role="status" className="text-sm text-muted-foreground">
+                    {activeTool?.type === 'step'
+                        ? activeTool.label
+                        : 'Thinking…'}
+                </p>
+            )}
+            {substantive && (
+                <AgentActivity
+                    items={items}
+                    status="complete"
+                    summary={working || !turn.seconds ? 'Activity' : undefined}
+                    duration={turn.seconds ?? 0}
+                />
+            )}
+        </>
     );
 }
 
@@ -534,16 +619,19 @@ function Chat({
     const waitingForUser = turns.some(
         (t) =>
             t.status === 'working' &&
-            userRequests(t.events ?? []).some((r) => !r.decided),
+            timeline(t).some(
+                (item) => item.kind === 'request' && !item.request.decided,
+            ),
     );
 
     const decide = async (
         runId: string,
-        callId: string,
+        request: UserRequest,
         approved: boolean,
         answer?: string,
     ) => {
-        const key = `${runId}/${callId}`;
+        const callId = request.call.id;
+        const key = `${runId}/${request.seq}`;
         setDeciding((d) => new Set(d).add(key));
         const res = await fetch(
             `/api/runs/${encodeURIComponent(runId)}/approvals`,
@@ -565,6 +653,19 @@ function Chat({
 
     const update = (id: number, f: (t: Turn) => Turn) =>
         setTurns((ts) => ts.map((t) => (t.id === id ? f(t) : t)));
+
+    const stopRun = async (turn: Turn) => {
+        if (!turn.runId) return;
+        update(turn.id, (t) => ({ ...t, cancelling: true }));
+        const request = cancelRun(turn.runId);
+        const res = await fetch(request.url, { method: request.method }).catch(
+            () => null,
+        );
+        if (res?.status !== 202) {
+            update(turn.id, (t) => ({ ...t, cancelling: false }));
+            alert('The stop request could not be sent. Please try again.');
+        }
+    };
 
     const sendPending = (ws: WebSocket) => {
         if (ws.readyState !== WebSocket.OPEN) return;
@@ -683,24 +784,32 @@ function Chat({
                 if (!('run_id' in frame)) return;
                 const subscription = watches.current.get(frame.run_id);
                 if (!subscription) return;
-                if (frame.type === 'event') {
+                if (frame.type === 'lifecycle') {
+                    update(subscription.replyId, (t) => ({
+                        ...t,
+                        lifecycle: frame.lifecycle,
+                        cancelling:
+                            frame.lifecycle.cancel_requested || t.cancelling,
+                        status:
+                            frame.lifecycle.status === 'running'
+                                ? 'working'
+                                : t.status,
+                    }));
+                } else if (frame.type === 'event') {
                     if (frame.seq <= subscription.after) return;
                     subscription.after = frame.seq;
                     subscription.started ??= performance.now();
-                    const e = frame.event;
+                    const e = { ...frame.event, seq: frame.seq };
                     update(subscription.replyId, (t) => ({
                         ...t,
                         status: 'working',
                         events: [...(t.events ?? []), e],
-                        messages: e.assistant_message
-                            ? [...(t.messages ?? []), e.assistant_message]
-                            : t.messages,
                         text:
                             e.kind === 'failed'
                                 ? `The run stopped: ${e.err}`
                                 : t.text,
                     }));
-                } else {
+                } else if (frame.type === 'end' || frame.type === 'error') {
                     watches.current.delete(frame.run_id);
                     const seconds =
                         subscription.started === undefined
@@ -722,6 +831,7 @@ function Chat({
                                   'The run stopped before it finished.'
                                 : t.text,
                         seconds,
+                        cancelling: false,
                     }));
                 }
             };
@@ -746,7 +856,7 @@ function Chat({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    const submit = (prompt: string) => {
+    const submit = (prompt: string, researchMode = deepResearch) => {
         const text = prompt.trim();
         if (!text || navigating.current) return;
         const userId = nextId.current++;
@@ -770,15 +880,89 @@ function Chat({
         pending.current.set(crypto.randomUUID(), {
             replyId,
             prompt: text,
-            deepResearch,
+            deepResearch: researchMode,
             initialHistory,
         });
+
         setTurns((t) => [
             ...t,
             { id: userId, from: 'user', text },
-            { id: replyId, from: 'assistant', text: '', status: 'queued' },
+            {
+                id: replyId,
+                from: 'assistant',
+                text: '',
+                status: 'queued',
+                retryPrompt: text,
+                deepResearch: researchMode,
+            },
         ]);
         if (socket.current) sendPending(socket.current);
+    };
+
+    const renderRequest = (turn: Turn, req: UserRequest) => {
+        const { call, decided } = req;
+        const key = `${turn.runId}/${req.seq}`;
+        const sending = !decided && deciding.has(key);
+        const ended = turn.status === 'done' || turn.status === 'error';
+        if (call.name === 'ask_user') {
+            const a = (call.args ?? {}) as {
+                question?: string;
+                options?: string[];
+            };
+            return (
+                <QuestionCard
+                    key={key}
+                    question={a.question ?? ''}
+                    options={a.options}
+                    status={
+                        !decided
+                            ? ended
+                                ? 'skipped'
+                                : sending
+                                  ? 'sending'
+                                  : 'pending'
+                            : decided.approved
+                              ? 'answered'
+                              : 'skipped'
+                    }
+                    answer={
+                        decided?.text ??
+                        (ended
+                            ? 'the run ended before an answer was recorded'
+                            : undefined)
+                    }
+                    onAnswer={(answer) =>
+                        decide(turn.runId!, req, true, answer)
+                    }
+                    onSkip={() => decide(turn.runId!, req, false)}
+                />
+            );
+        }
+        const status = approvalStatus(req);
+        return (
+            <ToolApproval
+                key={key}
+                tool={call.name}
+                description={
+                    call.name === 'remember'
+                        ? 'Save this information for future chats.'
+                        : call.name === 'schedule'
+                          ? 'Run this task on the approved schedule and deliver results in this chat.'
+                          : 'Allow the agent to perform this action.'
+                }
+                parameters={approvalParameters(call)}
+                defaultOpen
+                status={
+                    ended && (status === 'pending' || status === 'running')
+                        ? 'error'
+                        : status === 'pending' && sending
+                          ? 'approving'
+                          : status
+                }
+                onApprove={() => decide(turn.runId!, req, true)}
+                onDeny={() => decide(turn.runId!, req, false)}
+            />
+        );
     };
 
     const started = turns.length > 0;
@@ -809,6 +993,16 @@ function Chat({
                                           : 'Reconnecting…'
                                       : 'Ready'}
                             </span>
+                            {loading && (
+                                <button
+                                    type="button"
+                                    disabled={changingChat}
+                                    className="ml-auto text-sm text-muted-foreground underline-offset-4 hover:underline"
+                                    onClick={() => submit('/status', false)}
+                                >
+                                    Check status
+                                </button>
+                            )}
                         </div>
                         <MessageScroller
                             navigation="rail"
@@ -818,205 +1012,121 @@ function Chat({
                             contentClassName="mx-auto min-h-full w-full max-w-3xl"
                         >
                             <MessageGroup spacing="default">
-                                {turns.map((turn) => (
-                                    <Fragment key={turn.id}>
-                                        {turn.from === 'user' ||
-                                        turn.events?.length ||
-                                        turn.status !== 'done' ||
-                                        !assistantMessages(turn).length ? (
-                                            <Message
-                                                id={turn.runId}
-                                                from={turn.from}
-                                                animateIn
-                                            >
-                                                {turn.from === 'user' ? (
-                                                    <MessageBubble variant="solid">
-                                                        <MessageBubbleContent>
-                                                            {turn.text}
-                                                        </MessageBubbleContent>
-                                                    </MessageBubble>
-                                                ) : (
-                                                    <MessageContent className="flex flex-col gap-2">
-                                                        <RunActivity
-                                                            turn={turn}
-                                                            connected={
-                                                                connected
-                                                            }
-                                                        />
-                                                        {latestTodos(
-                                                            turn.events ?? [],
-                                                        ).length > 0 && (
-                                                            <TodoList
-                                                                items={latestTodos(
-                                                                    turn.events ??
-                                                                        [],
-                                                                )}
-                                                                title="Plan"
-                                                                defaultOpen
-                                                            />
-                                                        )}
-                                                        {userRequests(
-                                                            turn.events ?? [],
-                                                        ).map((req) => {
-                                                            const {
-                                                                call,
-                                                                decided,
-                                                            } = req;
-                                                            const key = `${turn.runId}/${call.id}`;
-                                                            const sending =
-                                                                !decided &&
-                                                                deciding.has(
-                                                                    key,
-                                                                );
-                                                            if (
-                                                                call.name ===
-                                                                'ask_user'
-                                                            ) {
-                                                                const a =
-                                                                    (call.args ??
-                                                                        {}) as {
-                                                                        question?: string;
-                                                                        options?: string[];
-                                                                    };
-                                                                return (
-                                                                    <QuestionCard
-                                                                        key={
-                                                                            key
-                                                                        }
-                                                                        question={
-                                                                            a.question ??
-                                                                            ''
-                                                                        }
-                                                                        options={
-                                                                            a.options
-                                                                        }
-                                                                        status={
-                                                                            !decided
-                                                                                ? sending
-                                                                                    ? 'sending'
-                                                                                    : 'pending'
-                                                                                : decided.approved
-                                                                                  ? 'answered'
-                                                                                  : 'skipped'
-                                                                        }
-                                                                        answer={
-                                                                            decided?.text
-                                                                        }
-                                                                        onAnswer={(
-                                                                            answer,
-                                                                        ) =>
-                                                                            decide(
-                                                                                turn.runId!,
-                                                                                call.id,
-                                                                                true,
-                                                                                answer,
-                                                                            )
-                                                                        }
-                                                                        onSkip={() =>
-                                                                            decide(
-                                                                                turn.runId!,
-                                                                                call.id,
-                                                                                false,
-                                                                            )
-                                                                        }
-                                                                    />
-                                                                );
-                                                            }
-                                                            const status =
-                                                                approvalStatus(
-                                                                    req,
-                                                                );
-                                                            return (
-                                                                <ToolApproval
-                                                                    key={key}
-                                                                    tool={
-                                                                        call.name
-                                                                    }
-                                                                    description={
-                                                                        call.name ===
-                                                                        'remember'
-                                                                            ? 'Save this information for future chats.'
-                                                                            : call.name ===
-                                                                                'schedule'
-                                                                              ? 'Run this task on the approved schedule and deliver results in this chat.'
-                                                                              : 'Allow the agent to perform this action.'
-                                                                    }
-                                                                    parameters={approvalParameters(
-                                                                        call,
-                                                                    )}
-                                                                    defaultOpen
-                                                                    status={
-                                                                        status ===
-                                                                            'pending' &&
-                                                                        sending
-                                                                            ? 'approving'
-                                                                            : status
-                                                                    }
-                                                                    onApprove={() =>
-                                                                        decide(
-                                                                            turn.runId!,
-                                                                            call.id,
-                                                                            true,
-                                                                        )
-                                                                    }
-                                                                    onDeny={() =>
-                                                                        decide(
-                                                                            turn.runId!,
-                                                                            call.id,
-                                                                            false,
-                                                                        )
-                                                                    }
-                                                                />
-                                                            );
-                                                        })}
-                                                        {screenshots(
-                                                            turn.events ?? [],
-                                                        ).map((id) => (
-                                                            <a
-                                                                key={id}
-                                                                href={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
-                                                                target="_blank"
-                                                                rel="noreferrer"
-                                                            >
-                                                                <img
-                                                                    src={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${id}`}
-                                                                    alt="Screenshot of the page the agent was on"
-                                                                    className="max-h-96 rounded-lg border"
-                                                                    loading="lazy"
-                                                                />
-                                                            </a>
-                                                        ))}
-                                                        {turn.status ===
-                                                            'error' &&
-                                                            turn.text}
-                                                    </MessageContent>
-                                                )}
-                                            </Message>
-                                        ) : null}
-                                        {turn.from === 'assistant' &&
-                                            assistantMessages(turn).map(
-                                                (text, index) => (
-                                                    <Message
-                                                        key={index}
-                                                        id={
-                                                            index === 0 &&
-                                                            turn.status ===
-                                                                'done' &&
-                                                            !turn.events?.length
-                                                                ? turn.runId
-                                                                : undefined
-                                                        }
-                                                        from="assistant"
-                                                        animateIn
-                                                    >
+                                {turns.map((turn) =>
+                                    turn.from === 'user' ? (
+                                        <Message
+                                            key={turn.id}
+                                            from="user"
+                                            animateIn
+                                        >
+                                            <MessageBubble variant="solid">
+                                                <MessageBubbleContent>
+                                                    {turn.text}
+                                                </MessageBubbleContent>
+                                            </MessageBubble>
+                                        </Message>
+                                    ) : (
+                                        <div
+                                            key={turn.id}
+                                            id={turn.runId}
+                                            className="flex min-w-0 flex-col items-start gap-2"
+                                        >
+                                            {timeline(turn).map((item) => (
+                                                <Message
+                                                    key={`${item.kind}/${item.seq}`}
+                                                    from="assistant"
+                                                    animateIn
+                                                >
+                                                    {item.kind === 'message' ? (
                                                         <AssistantMarkdown
-                                                            text={text}
+                                                            text={item.text}
                                                         />
-                                                    </Message>
-                                                ),
+                                                    ) : (
+                                                        <MessageContent>
+                                                            {item.kind ===
+                                                                'request' &&
+                                                                renderRequest(
+                                                                    turn,
+                                                                    item.request,
+                                                                )}
+                                                            {item.kind ===
+                                                                'plan' && (
+                                                                <TodoList
+                                                                    items={
+                                                                        item.items
+                                                                    }
+                                                                    title="Plan"
+                                                                    defaultOpen
+                                                                />
+                                                            )}
+                                                            {item.kind ===
+                                                                'screenshot' && (
+                                                                <a
+                                                                    href={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${item.id}`}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                >
+                                                                    <img
+                                                                        src={`/api/runs/${encodeURIComponent(turn.runId!)}/artifacts/${item.id}`}
+                                                                        alt="Screenshot of the page the agent was on"
+                                                                        className="max-h-96 rounded-lg border"
+                                                                        loading="lazy"
+                                                                    />
+                                                                </a>
+                                                            )}
+                                                        </MessageContent>
+                                                    )}
+                                                </Message>
+                                            ))}
+                                            {turn.events?.length ||
+                                            turn.status !== 'done' ? (
+                                                <RunActivity
+                                                    turn={turn}
+                                                    connected={connected}
+                                                />
+                                            ) : null}
+                                            {turn.runId &&
+                                                (turn.status === 'queued' ||
+                                                    turn.status ===
+                                                        'working') &&
+                                                !turn.cancelling && (
+                                                    <button
+                                                        type="button"
+                                                        className="text-sm text-muted-foreground underline-offset-4 hover:underline"
+                                                        onClick={() =>
+                                                            void stopRun(turn)
+                                                        }
+                                                    >
+                                                        Stop run
+                                                    </button>
+                                                )}
+                                            {turn.status === 'error' && (
+                                                <p
+                                                    role="alert"
+                                                    className="text-sm text-destructive"
+                                                >
+                                                    {turn.text}
+                                                </p>
                                             )}
-                                    </Fragment>
-                                ))}
+                                            {turn.status === 'error' &&
+                                                turn.retryPrompt && (
+                                                    <button
+                                                        type="button"
+                                                        className="text-sm text-muted-foreground underline-offset-4 hover:underline"
+                                                        onClick={() =>
+                                                            submit(
+                                                                turn.retryPrompt!,
+                                                                turn.deepResearch ??
+                                                                    false,
+                                                            )
+                                                        }
+                                                    >
+                                                        Run again
+                                                    </button>
+                                                )}
+                                        </div>
+                                    ),
+                                )}
                             </MessageGroup>
                         </MessageScroller>
                     </>
@@ -1049,7 +1159,10 @@ function Chat({
                 >
                     <PromptInput
                         disabled={changingChat}
-                        onSubmit={submit}
+                        onSubmit={(prompt) => {
+                            submit(prompt);
+                            if (deepResearch) toggleDeepResearch();
+                        }}
                         leadingAction={
                             <button
                                 type="button"

@@ -83,7 +83,10 @@ admits and supervises runs. The memory tools are available to new chat runs.
    dispatcher claims it in Postgres, saves the workflow input assembled from
    completed turns, and starts its registered workflow on Temporal (task queue
    `hypo-agent`, workflow ID = application run ID). Admission bounds each user
-   to 10 queued and two active runs, with one active run per conversation.
+   to 10 queued runs. Each account has four foreground slots and three
+   independent background slots. Turns in one conversation run concurrently;
+   only the account caps queue them. The **Check status** button sends `/status`, whose reply is saved
+   directly from the conversation’s lifecycle state and bypasses admission.
 3. The page sends a `watch` frame for each queued or active run on the same socket.
 4. `cmd/worker` runs it: `executor.Run` folds events through `agent.Reduce`,
    calling the model (and tools, once there are any) as activities until the
@@ -107,6 +110,21 @@ The supervisor checks Temporal independently of the socket. A final event and it
 terminal runtime state commit together. When a workflow closes without a
 final event, the supervisor releases its slot and subscribers receive an
 error frame. `memkernel` is used only in tests.
+
+### Stopping and retrying runs
+
+`POST /api/runs/{id}/cancel` records an owner-scoped stop request.
+A queued run closes in the same transaction. The supervisor sends
+cancellation for active workflows and releases their slot when Temporal
+reports closure. The WebSocket sends lifecycle updates and the reason a
+run is waiting. **Run again** submits the original prompt as a new run.
+
+With `agent-orchestrator-v3`, ordinary search and page reads get three calls
+in the foreground. On the fourth, the workflow tries to move to the
+background lane and continues with stateless web tools. Interactive browser
+sessions stay in the foreground. If the background lane is
+full, it answers using the evidence collected. Older workflow registrations
+remain available for replay.
 
 ## Repo map
 
@@ -326,7 +344,7 @@ registry must be the same on every worker and must not change under live runs.
 | `browser_screenshot` | Obscura + `run_artifacts` | PNG stored per run, shown in the chat; the model only gets `[artifact:<id>]` |
 | `todo_write` | none | the agent's plan; the chat renders the latest list (beUI `TodoList`) |
 | `ask_user` | executor | pauses the run for the user's answer (see Approvals) |
-| `research` | executor | up to 4 parallel subagents (see Subagents) |
+| `research` | executor | up to 4 ordered investigations (see Subagents) |
 
 Every action tool reports where the page is afterwards, following any
 navigation it started (`page.settle`: a `frameNavigated` within a second,
@@ -365,8 +383,9 @@ service), and add it to the registry in `cmd/worker`.
 
 `research {tasks: [{title, prompt}]}` is carried out in workflow code
 (`Runner.research`): one `c.Spawn` per task (Temporal child workflows
-`<run>/<n>` on the same queue, so they run in parallel), then each child's
-final answer under its title. A child is a full agent run with
+`<run>/<n>` on the same queue), then each child's final answer under its
+title. In new workflows the parent joins each child before starting the next.
+Existing workflow registrations retain their prior execution order. A child is a full agent run with
 `Input.Subagent` set: it is offered no `ask_user`, `research` or Write tools,
 its events aren't streamed (the parent's tool result reports it), and its
 screenshots and ledger entries belong to the top-level run. Each child has its
@@ -407,7 +426,7 @@ scroll, wait, screenshot.
 
 ## Persistent memory
 
-New interactive runs use `agent-discovery-v1`. The model can look up the
+New interactive runs use `agent-orchestrator-v3`. The model can look up the
 memory tools with `search_tools`.
 The worker retains prior workflow registrations for replay.
 Roll out the migration, then the new worker and server. Version information
@@ -468,15 +487,17 @@ due time. After longer downtime, the series records the expired due occurrence
 and advances to the first eligible date. Cancelling a series stops future
 occurrences. Runs already admitted follow the normal run lifecycle.
 
-Scheduled runs use `agent-scheduled-v1` with the approved prompt and pinned
+Scheduled runs use `agent-scheduled-v2` with the approved prompt and pinned
 skill catalog. The profile offers web search, stateless browsing, skills,
 and research subagents. The task result streams to the original chat.
 
 ## Deep research mode
 
 The prompt composer sends `deep_research: true` to `POST /api/runs`. Admission
-pins `agent-deep-research-v2` in the saved input. The worker retains v1 for replay. The workflow checkpoints
-planning, parallel collection, targeted follow-up, drafting, independent
+pins `agent-deep-research-v4` in the saved input. The worker retains v1 to
+v3 for replay. v4 first replies in chat, the way a person would before going
+off to research: one journaled `deep/opener` model call (with a fixed
+fallback) whose text rides on the first stage's reply. The workflow checkpoints planning, ordered collection, targeted follow-up, drafting, independent
 review, and the revised report. Progress reaches the existing event stream
 through named research-stage events represented as tool calls and results.
 
@@ -504,16 +525,21 @@ The Postgres function `run_assistant_messages` projects these messages from
 the event journal in sequence order. The run feed includes projected text as
 `assistant_message`. Reloaded chats and follow-up prompts use the same
 projection. Keep tool errors and other tool results out of the projection.
-Assistant Markdown supports tables, lists, and source links. The renderer
-drops raw HTML and remote images.
+The chat renders replies, questions, approvals, the latest plan, and
+screenshots in journal order. The activity panel is expandable.
+Assistant Markdown supports tables, lists, and source links, uses a
+bounded reading width, and drops raw HTML and remote images. For longer
+tasks, the orchestrator asks the model for a short opener alongside
+its first tool call and useful updates when there is a concrete finding or
+blocker. Quick questions can finish in one message.
 
 Apply the assistant messages migration before deploying the server and
 worker. The worker keeps the prior workflow registrations for replay.
 
 ## Tool discovery
 
-The top-level `agent-discovery-v1` workflow starts with seven tools.
-The model calls `search_tools {query}` for browser sessions, parallel
+The top-level orchestrator workflow starts with seven tools.
+The model calls `search_tools {query}` for browser sessions, ordered
 research, memory, or schedules. The matcher searches the workflow's
 authorized catalog. It returns one group, whose schemas become available
 on the next model call and stay available for the rest of the run.
@@ -526,6 +552,33 @@ order, ranking, and four-attempt budget stable for this workflow version.
 Research children, Deep Research, and scheduled runs have fixed lists.
 Deploy workers with the new registration before routing new chat runs
 to it. See [tool discovery](.junie/plans/tool-discovery.md).
+
+## Foreground chat and background research
+
+Explicit Deep Research and scheduled runs enter the background lane.
+When an interactive turn calls `research`, the journaled `research.yield`
+activity releases its foreground slot. It claims one of the account's
+background slots under the scheduler lock. When every background slot is
+busy, the tool result asks the orchestrator to answer with the sources it
+can verify now. A yielded turn joins its investigations in order, then synthesizes with
+no tools. If synthesis is blank, fails, or exceeds an execution budget, the
+turn returns the collected notes.
+
+The next prompt is answered while earlier turns are still working, in
+either lane. The dispatcher gives it the completed conversation and the
+earlier prompts that are still active or queued, from one database
+snapshot. Only the account caps queue a turn.
+
+The orchestrator supervises the rest of the chat. At claim time the
+dispatcher writes `Input.Progress`: each unfinished earlier run's status,
+lane, elapsed time, deep research stage, search count, pages read, and last
+public message. It is persisted with the input, so replay sees the same view.
+The orchestrator reports progress from it and avoids duplicating covered
+research. It cannot stop runs; the user's Stop run button does. Deep
+research children don't journal events, so those runs report stages only. The dispatcher starts
+workflows in their own goroutines, and the supervisor checks all due runs
+concurrently.
+Apply the lane migrations before deploying the server and workers.
 
 ## Model gateway
 

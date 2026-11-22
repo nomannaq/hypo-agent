@@ -116,6 +116,7 @@ Runs survive worker crashes and pass the conformance and chaos tests.
 - Durable admission, concurrent-run caps, and workflow reconciliation are implemented in `internal/runtime`. The scheduler integration test passed on Postgres 17.
 - One-shot, daily, and weekly user schedules deliver durable runs to the original conversation. Account-level spend controls are follow-up work.
 - ✓ Add kill-worker chaos test.
+- ✓ Separate foreground chat from background research and join new research subagents in plan order.
 
 Runs from `POST /api/runs` execute on Temporal via `cmd/worker`. Both kernels pass conformance, and the Temporal chaos test covers worker loss. The proposed delivery order for durable admission, supervision, memory, skills, and scheduled runs is in [Memory, skills, and scheduling](memory-skills-and-scheduling.md).
 
