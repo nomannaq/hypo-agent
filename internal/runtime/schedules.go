@@ -130,14 +130,15 @@ func (s Scheduler) createSchedule(ctx context.Context, runID, key string, args s
 		return Schedule{}, err
 	}
 	supportsRecurrence := source.Workflow == executor.RecurringWorkflowName ||
-		source.Workflow == executor.MessagingWorkflowName || source.Workflow == executor.DiscoveryWorkflowName
+		source.Workflow == executor.MessagingWorkflowName || source.Workflow == executor.DiscoveryWorkflowName ||
+		executor.IsOrchestratorWorkflow(source.Workflow)
 	if !args.Repeat.Valid() || (args.Repeat != Once && !supportsRecurrence) {
 		return Schedule{}, errors.New("this run cannot create the requested recurrence")
 	}
 	if err := source.Skills.Validate(); err != nil {
 		return Schedule{}, err
 	}
-	input, err := json.Marshal(executor.Input{Workflow: executor.ScheduledWorkflowName, Prompt: task, Skills: source.Skills})
+	input, err := json.Marshal(executor.Input{Workflow: executor.ScheduledWorkflowV2, Prompt: task, Skills: source.Skills})
 	if err != nil {
 		return Schedule{}, err
 	}
@@ -270,6 +271,9 @@ func (s Scheduler) fireOne(ctx context.Context) error {
 	var input executor.Input
 	if err := json.Unmarshal(raw, &input); err != nil {
 		return err
+	}
+	if input.Workflow == executor.ScheduledWorkflowName {
+		input.Workflow = executor.ScheduledWorkflowV2
 	}
 
 	if repeat != Once {

@@ -61,13 +61,14 @@ const (
 	AgentFailed
 	StartFailed
 	WorkflowClosed
+	UserCancelled
 	numEvents
 )
 
 var eventNames = [...]string{
 	DispatchClaimed: "dispatch_claimed", WorkflowStarted: "workflow_started",
 	AgentSucceeded: "agent_succeeded", AgentFailed: "agent_failed",
-	StartFailed: "start_failed", WorkflowClosed: "workflow_closed_without_final",
+	StartFailed: "start_failed", WorkflowClosed: "workflow_closed_without_final", UserCancelled: "user_cancelled",
 }
 
 var _ [numEvents]string = eventNames
@@ -98,9 +99,9 @@ func (e *EventKind) UnmarshalText(b []byte) error {
 }
 
 var transitions = [numStatuses][numEvents]Status{
-	Queued:   {DispatchClaimed: Starting},
-	Starting: {WorkflowStarted: Running, AgentSucceeded: Succeeded, AgentFailed: Failed, StartFailed: Failed, WorkflowClosed: Failed},
-	Running:  {AgentSucceeded: Succeeded, AgentFailed: Failed, WorkflowClosed: Failed},
+	Queued:   {DispatchClaimed: Starting, UserCancelled: Failed},
+	Starting: {WorkflowStarted: Running, AgentSucceeded: Succeeded, AgentFailed: Failed, StartFailed: Failed, WorkflowClosed: Failed, UserCancelled: Failed},
+	Running:  {AgentSucceeded: Succeeded, AgentFailed: Failed, WorkflowClosed: Failed, UserCancelled: Failed},
 }
 
 func transition(from Status, event EventKind) (Status, error) {
