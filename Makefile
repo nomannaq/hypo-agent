@@ -3,7 +3,7 @@ export
 
 .PHONY: up down migrate rollback status migration goose seed fresh dev serve worker build test smoke
 
-up:            ; docker compose up -d --wait
+up:            ; docker compose up -d --wait --build
 down:          ; docker compose down
 migrate:       ; go run ./cmd/migrate up
 rollback:      ; go run ./cmd/migrate down

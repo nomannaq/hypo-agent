@@ -60,26 +60,20 @@ func main() {
 		tool.Research(),
 		tool.WebSearch(cmp.Or(os.Getenv("SEARXNG_URL"), "http://localhost:8888")),
 		tool.Browse(obscura, obscuraToken),
-		tool.BrowserOpen(obscura, obscuraToken),
-		tool.BrowserSnapshot(),
-		tool.BrowserClick(),
-		tool.BrowserType(),
-		tool.BrowserSelect(),
-		tool.BrowserPress(),
-		tool.BrowserScroll(),
-		tool.BrowserBack(),
-		tool.BrowserWait(),
-		tool.BrowserScreenshot(func(ctx context.Context, runID, key, mime string, data []byte) (string, error) {
-			// Subagent runs are "<parent>/<n>": artifacts belong to the
-			// top-level run the user owns.
-			root, _, _ := strings.Cut(runID, "/")
-			var id string
-			err := db.QueryRow(ctx, `INSERT INTO run_artifacts (id, key, run_id, mime, data) VALUES ($1, $2, $3, $4, $5)
-					ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data RETURNING id`,
-				"a-"+rand.Text(), key, root, mime, data).Scan(&id)
-			return id, err
-		}),
 	}
+	saveScreenshot := func(ctx context.Context, runID, key, mime string, data []byte) (string, error) {
+		// Subagent runs are "<parent>/<n>": artifacts belong to the
+		// top-level run the user owns.
+		root, _, _ := strings.Cut(runID, "/")
+		var id string
+		err := db.QueryRow(ctx, `INSERT INTO run_artifacts (id, key, run_id, mime, data) VALUES ($1, $2, $3, $4, $5)
+					ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data RETURNING id`,
+			"a-"+rand.Text(), key, root, mime, data).Scan(&id)
+		return id, err
+	}
+	browserService := cmp.Or(os.Getenv("BROWSER_SESSION_URL"), "http://127.0.0.1:9233")
+	registry = append(registry, tool.RemoteBrowserTools(browserService, obscuraToken, saveScreenshot)...)
+
 	runner := &executor.Runner{
 		Model:  modelClient,
 		System: executor.SystemPrompt,

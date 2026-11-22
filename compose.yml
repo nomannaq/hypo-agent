@@ -41,6 +41,24 @@ services:
       OBSCURA_CDP_TOKEN: ${OBSCURA_CDP_TOKEN:?set OBSCURA_CDP_TOKEN in .env (openssl rand -hex 32)}
     ports: ["127.0.0.1:9222:9222"]
 
+  # Holds live CDP connections across agent worker restarts.
+  browser-sessions:
+    build:
+      context: .
+      dockerfile: docker/browser-sessions.Dockerfile
+    depends_on:
+      - obscura
+    environment:
+      BROWSER_SESSION_LISTEN: 0.0.0.0:9233
+      OBSCURA_URL: http://obscura:9222
+      OBSCURA_CDP_TOKEN: ${OBSCURA_CDP_TOKEN:?set OBSCURA_CDP_TOKEN in .env (openssl rand -hex 32)}
+    ports: ["127.0.0.1:9233:9233"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9233/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
   # Metasearch for the agent's web_search tool (JSON API, no key).
   searxng:
     image: searxng/searxng:2026.11.20-cd6d28091
