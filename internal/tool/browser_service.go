@@ -76,11 +76,12 @@ func BrowserService(cdpURL, token string) http.Handler {
 			return
 		}
 
+		runID := call.RunID
 		mu.Lock()
-		run := runs[call.RunID]
+		run := runs[runID]
 		if run == nil {
 			run = &browserRun{gate: make(chan struct{}, 1), receipts: map[string]browserReceipt{}}
-			runs[call.RunID] = run
+			runs[runID] = run
 		}
 		run.activeCalls++
 		mu.Unlock()
@@ -92,8 +93,8 @@ func BrowserService(cdpURL, token string) http.Handler {
 				run.expiry = time.AfterFunc(sessionIdleTTL, func() {
 					mu.Lock()
 					defer mu.Unlock()
-					if run.activeCalls == 0 && time.Since(run.lastUsed) >= sessionIdleTTL {
-						delete(runs, call.RunID)
+					if runs[runID] == run && run.activeCalls == 0 && time.Since(run.lastUsed) >= sessionIdleTTL {
+						delete(runs, runID)
 					}
 				})
 			} else {
