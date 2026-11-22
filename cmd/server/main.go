@@ -16,13 +16,17 @@ import (
 	"go.temporal.io/sdk/client"
 
 	"nomanqureshi.dev/hpyo-agent/internal/dotenv"
+	"nomanqureshi.dev/hpyo-agent/internal/runtime"
+	"nomanqureshi.dev/hpyo-agent/skills"
 )
 
 type server struct {
-	db       *pgxpool.Pool
-	app      *inertia.ViteInstance
-	temporal client.Client
-	hub      *hub
+	db        *pgxpool.Pool
+	app       *inertia.ViteInstance
+	temporal  client.Client
+	hub       *hub
+	scheduler runtime.Scheduler
+	skills    *skills.Catalog
 }
 
 func main() {
@@ -64,7 +68,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{db: db, app: app, temporal: tc, hub: newHub()}
+	catalog, err := skills.Bundled()
+	if err != nil {
+		log.Fatalf("loading skills: %v", err)
+	}
+	s := &server{db: db, app: app, temporal: tc, hub: newHub(), skills: catalog}
+	s.scheduler = runtime.Scheduler{DB: db, Start: s.startWorkflow, Inspect: s.inspectWorkflow}
+	go s.scheduler.Dispatch(context.Background())
+	go s.scheduler.Supervise(context.Background())
+	go s.scheduler.DispatchSchedules(context.Background())
 	go s.hub.listen(db.Config().ConnConfig)
 
 	mux := http.NewServeMux()
@@ -77,7 +89,9 @@ func main() {
 	mux.HandleFunc("POST /register", s.guestOnly(s.register))
 	mux.HandleFunc("POST /logout", s.logout)
 
-	mux.HandleFunc("GET /agent", s.authOnly(s.page("agent")))
+	mux.HandleFunc("GET /agent", s.authOnly(s.agentPage))
+	mux.HandleFunc("GET /schedules", s.authOnly(s.schedulesPage))
+	mux.HandleFunc("DELETE /api/schedules/{id}", s.authOnly(s.cancelSchedule))
 	mux.HandleFunc("POST /api/runs", s.authOnly(s.startRun))
 	mux.HandleFunc("GET /api/runs/{id}/events", s.authOnly(s.runEvents))
 	mux.HandleFunc("POST /api/runs/{id}/approvals", s.authOnly(s.decideApproval))
@@ -89,6 +103,9 @@ func main() {
 	mux.HandleFunc("GET /settings/security", s.authOnly(s.page("settings/security")))
 	mux.HandleFunc("PUT /settings/password", s.authOnly(s.updatePassword))
 	mux.HandleFunc("GET /settings/appearance", s.authOnly(s.page("settings/appearance")))
+	mux.HandleFunc("GET /settings/memory", s.authOnly(s.memoryPage))
+	mux.HandleFunc("PUT /settings/memory", s.authOnly(s.updateMemorySettings))
+	mux.HandleFunc("DELETE /settings/memory/{id}", s.authOnly(s.deleteMemory))
 
 	addr := ":" + os.Getenv("PORT")
 	if addr == ":" {
@@ -117,8 +134,8 @@ func (s *server) page(component string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) { s.render(w, r, component) }
 }
 
-func (s *server) render(w http.ResponseWriter, r *http.Request, component string) {
-	if err := s.app.Render(w, r, component); err != nil {
+func (s *server) render(w http.ResponseWriter, r *http.Request, component string, props ...inertia.Props) {
+	if err := s.app.Render(w, r, component, props...); err != nil {
 		s.fail(w, err)
 	}
 }

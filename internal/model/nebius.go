@@ -61,8 +61,9 @@ type Usage struct {
 }
 
 type Request struct {
-	Messages []Message
-	Tools    []Tool
+	Messages  []Message
+	Tools     []Tool
+	MaxTokens int `json:",omitempty"`
 }
 
 type Response struct {
@@ -118,6 +119,9 @@ func (c *Client) Complete(ctx context.Context, req Request) (Response, error) {
 	payload := map[string]any{"model": c.Model, "messages": req.Messages}
 	if len(req.Tools) > 0 {
 		payload["tools"] = req.Tools
+	}
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
