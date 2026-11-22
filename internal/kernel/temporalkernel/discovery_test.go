@@ -37,7 +37,7 @@ func TestDiscoveryReplaysOfferedSchemasAfterWorkerLoss(t *testing.T) {
 	})
 	r := &executor.Runner{
 		WorkflowType: executor.DiscoveryWorkflowName,
-		Tools:        tool.Registry{tool.SearchTools(), tool.BrowserOpen("", ""), snapshot, tool.WebSearch("")},
+		Tools:        tool.Registry{tool.SearchTools(), tool.BrowserOpen("", ""), snapshot, tool.WebSearch(tool.Searcher{})},
 		Model: fakeModel(func(ctx context.Context, req model.Request) (model.Response, error) {
 			switch last := req.Messages[len(req.Messages)-1]; last.ToolCallID {
 			case "snapshot":

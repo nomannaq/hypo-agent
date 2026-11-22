@@ -83,7 +83,7 @@ func TestSkillsPinCatalogAcrossWorkerRestart(t *testing.T) {
 		r := &executor.Runner{
 			WorkflowType: executor.SkillsWorkflowName,
 			Model:        fake,
-			Tools:        tool.Registry{read, tool.Research(), tool.WebSearch(search.URL)},
+			Tools:        tool.Registry{read, tool.Research(), tool.WebSearch(tool.Searcher{SearXNG: search.URL})},
 		}
 		w := worker.New(dev.Client(), queue, worker.Options{})
 		opts := temporalkernel.Options{ActivityTimeout: 10 * time.Second, MaxAttempts: 3, RetryInterval: 100 * time.Millisecond, HeartbeatTimeout: time.Second}

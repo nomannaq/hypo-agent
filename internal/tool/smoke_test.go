@@ -17,7 +17,7 @@ func TestSmokeSearch(t *testing.T) {
 	if base == "" {
 		t.Skip("SEARXNG_URL not set")
 	}
-	out, err := WebSearch(base).Run(t.Context(), json.RawMessage(`{"query":"caffeine short-term memory","limit":3}`))
+	out, err := WebSearch(Searcher{SearXNG: base}).Run(t.Context(), json.RawMessage(`{"query":"caffeine short-term memory","limit":3}`))
 	if err != nil {
 		t.Fatal(err)
 	}

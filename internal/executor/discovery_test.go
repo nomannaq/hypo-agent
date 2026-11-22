@@ -49,7 +49,7 @@ func TestDiscoveryOffersToolsOnNextTurn(t *testing.T) {
 			schedule.Effect = tool.Write
 			var events []agent.Event
 			r := &Runner{WorkflowType: DiscoveryWorkflowName, Model: m, Tools: tool.Registry{
-				schedule, tool.WebSearch(""), tool.SearchTools(),
+				schedule, tool.WebSearch(tool.Searcher{}), tool.SearchTools(),
 			}, Events: func(_ context.Context, _ string, _ int, e agent.Event) error {
 				events = append(events, e)
 				return nil
@@ -85,7 +85,7 @@ func TestDiscoveryBudgetAndChildProfile(t *testing.T) {
 	schedule := tool.Tool{Name: "schedule", Effect: tool.Write}
 	r := &Runner{
 		WorkflowType: DiscoveryWorkflowName,
-		Tools:        tool.Registry{tool.SearchTools(), tool.WebSearch(""), tool.BrowserOpen("", ""), schedule},
+		Tools:        tool.Registry{tool.SearchTools(), tool.WebSearch(tool.Searcher{}), tool.BrowserOpen("", ""), schedule},
 		PrivateTools: []string{tool.SearchToolsName},
 	}
 	r.Model = modelFunc(func(req model.Request) model.Response {
