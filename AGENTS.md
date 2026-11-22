@@ -335,7 +335,7 @@ registry must be the same on every worker and must not change under live runs.
 
 | Tool | Backend | Notes |
 |---|---|---|
-| `web_search` | SearXNG JSON API (`SEARXNG_URL`) | `{query, limit}`; limit defaults to 5, capped at 10 |
+| `web_search` | Brave Search API (`BRAVE_SEARCH_API_KEY`), then SearXNG (`SEARXNG_URL`) | `{query, limit}`; limit defaults to 5, capped at 10. Results are cached in `search_cache` for a day by normalized query |
 | `browse` | Obscura over CDP (`OBSCURA_URL`, `OBSCURA_CDP_TOKEN`) | `{url}`; reads a page in a fresh browser context: title, URL, Markdown. Stateless, so subagents use it freely |
 | `browser_open` | Obscura | `{url}`; opens the run's session page (replacing any open one) |
 | `browser_snapshot` | Obscura | numbered interactive elements (`[3] button "Send"`, current values), then up to 8 KB of page Markdown |
@@ -618,8 +618,10 @@ cd web && npm run typecheck && npm run lint
 `OBSCURA_CDP_TOKEN` (required by `make up` and the worker; `openssl rand -hex
 32`), optional `NEBIUS_MODEL`, `NEBIUS_BASE_URL`, `TEMPORAL_ADDRESS` (default
 `localhost:7233`), `OBSCURA_URL` (default `http://localhost:9222`),
-`BROWSER_SESSION_URL` (default `http://127.0.0.1:9233`), and
-`SEARXNG_URL` (default `http://localhost:8888`). Start the session service
+`BROWSER_SESSION_URL` (default `http://127.0.0.1:9233`),
+`SEARXNG_URL` (default `http://localhost:8888`), and `BRAVE_SEARCH_API_KEY`
+(optional; queries go to Brave first, and SearXNG answers if Brave fails or
+finds nothing). Start the session service
 before rolling out workers that use it. Tabs opened by the old in-process
 worker need to be reopened during this transition. The server and worker also load `.env` themselves when
 started without `make` (`internal/dotenv`); `go test` does not.
@@ -703,5 +705,11 @@ started without `make` (`internal/dotenv`); `go test` does not.
 - **Docker Compose needs `OBSCURA_CDP_TOKEN`** for every command (even
   `docker compose exec db ...`), since compose.yml interpolates it. Keep it in
   `.env`.
+- **Search engines block scrapers.** SearXNG queries several engines
+  (`docker/searxng/settings.yml`) because Google, Bing, Qwant and
+  DuckDuckGo often refuse or time out from one IP under agent load. If
+  `web_search` returns nothing, check `unresponsive_engines` in
+  `curl 'localhost:8888/search?q=test&format=json'`. Only non-empty results
+  are cached.
 - **Run test servers on another port** (e.g. `PORT=8091`) when `make dev` is
   already running; don't kill processes by name.

@@ -13,10 +13,7 @@ import {
     MessageBubble,
     MessageBubbleContent,
 } from '@/components/agents/message-bubble';
-import {
-    AgentActivity,
-    type AgentActivityItem,
-} from '@/components/agents/agent-activity';
+import { type AgentActivityItem } from '@/components/agents/agent-activity';
 import {
     ToolApproval,
     type ToolApprovalStatus,
@@ -520,9 +517,7 @@ function RunActivity({ turn, connected }: { turn: Turn; connected: boolean }) {
         turn.lifecycle?.background_research ??
         (turn.backgroundResearch || turn.deepResearch);
     if (turn.status === 'queued') {
-        let label = background
-            ? 'Research will start shortly'
-            : 'Queued';
+        let label = background ? 'Research will start shortly' : 'Queued';
         if (!turn.runId)
             label = connected ? 'Sending…' : 'Waiting for connection…';
         else if (turn.lifecycle?.status === 'starting') label = 'Starting…';
@@ -544,26 +539,11 @@ function RunActivity({ turn, connected }: { turn: Turn; connected: boolean }) {
             item.status === 'active' &&
             item.id.startsWith('tool-'),
     );
-    const substantive = items.some((item) => item.id.startsWith('tool-'));
-    return (
-        <>
-            {working && (
-                <p role="status" className="text-sm text-muted-foreground">
-                    {activeTool?.type === 'step'
-                        ? activeTool.label
-                        : 'Thinking…'}
-                </p>
-            )}
-            {substantive && (
-                <AgentActivity
-                    items={items}
-                    status="complete"
-                    summary={working || !turn.seconds ? 'Activity' : undefined}
-                    duration={turn.seconds ?? 0}
-                />
-            )}
-        </>
-    );
+    return working ? (
+        <p role="status" className="text-sm text-muted-foreground">
+            {activeTool?.type === 'step' ? activeTool.label : 'Thinking…'}
+        </p>
+    ) : null;
 }
 
 function Chat({
@@ -1053,10 +1033,32 @@ function Chat({
                                                                 'plan' && (
                                                                 <TodoList
                                                                     items={
-                                                                        item.items
+                                                                        turn.status ===
+                                                                            'done' ||
+                                                                        turn.status ===
+                                                                            'error'
+                                                                            ? // An ended run can't progress its plan: no spinners.
+                                                                              item.items.map(
+                                                                                  (
+                                                                                      todo,
+                                                                                  ) =>
+                                                                                      todo.status ===
+                                                                                      'in-progress'
+                                                                                          ? {
+                                                                                                ...todo,
+                                                                                                status: 'pending' as const,
+                                                                                            }
+                                                                                          : todo,
+                                                                              )
+                                                                            : item.items
                                                                     }
                                                                     title="Plan"
-                                                                    defaultOpen
+                                                                    defaultOpen={
+                                                                        turn.status !==
+                                                                            'done' &&
+                                                                        turn.status !==
+                                                                            'error'
+                                                                    }
                                                                 />
                                                             )}
                                                             {item.kind ===
