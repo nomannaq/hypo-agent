@@ -143,7 +143,20 @@ func main() {
 	withRecurrence := withSchedules
 	withRecurrence.WorkflowType = executor.RecurringWorkflowName
 	withRecurrence.System += " Daily and weekly schedules keep their local time. Confirm the intended frequency, first date, time and timezone."
-	withRecurrence.Tools = append(slices.Clone(skillTools), (runtime.Scheduler{DB: db}).ScheduleTool(true))
+	recurringTools := append(slices.Clone(skillTools), (runtime.Scheduler{DB: db}).ScheduleTool(true))
+	withRecurrence.Tools = recurringTools
+
+	withMessaging := withRecurrence
+	withMessaging.WorkflowType = executor.MessagingWorkflowName
+	withMessaging.System += " Give the answer up front. Use plain text for short replies and readable Markdown for longer ones: short paragraphs, headings only where useful, lists for steps or findings, and links for sources. Keep any text alongside tool calls suitable for the user to read. Use send_message for a useful standalone update during longer work or when asked for separate messages. Skip routine narration and avoid repeating earlier updates verbatim in the final reply."
+	messagingTools := append(slices.Clone(recurringTools), tool.SendMessage())
+	withMessaging.Tools = messagingTools
+	withMessaging.PrivateTools = append(slices.Clone(withRecurrence.PrivateTools), tool.SendMessageName)
+
+	withDiscovery := withMessaging
+	withDiscovery.WorkflowType = executor.DiscoveryWorkflowName
+	withDiscovery.Tools = append(slices.Clone(messagingTools), tool.SearchTools())
+	withDiscovery.PrivateTools = append(slices.Clone(withMessaging.PrivateTools), tool.SearchToolsName)
 
 	unattended := *runner
 	unattended.WorkflowType = executor.ScheduledWorkflowName
@@ -174,10 +187,12 @@ func main() {
 	temporalkernel.RegisterWorkflow(w, executor.SchedulingWorkflowName, withSchedules.Workflow, temporalkernel.DefaultOptions)
 	temporalkernel.RegisterWorkflow(w, executor.ScheduledWorkflowName, unattended.Workflow, temporalkernel.DefaultOptions)
 	temporalkernel.RegisterWorkflow(w, executor.RecurringWorkflowName, withRecurrence.Workflow, temporalkernel.DefaultOptions)
+	temporalkernel.RegisterWorkflow(w, executor.MessagingWorkflowName, withMessaging.Workflow, temporalkernel.DefaultOptions)
+	temporalkernel.RegisterWorkflow(w, executor.DiscoveryWorkflowName, withDiscovery.Workflow, temporalkernel.DefaultOptions)
 	temporalkernel.RegisterWorkflow(w, executor.DeepResearchWorkflowName, runner.DeepResearchWorkflow, temporalkernel.DefaultOptions)
 	temporalkernel.RegisterWorkflow(w, executor.DeepResearchWorkflowV2, runner.DeepResearchWorkflow, temporalkernel.DefaultOptions)
 	temporalkernel.RegisterWorkflow(w, executor.DeepResearchWorkerName, deepWorker.Workflow, temporalkernel.DefaultOptions)
-	for name, fn := range withRecurrence.Activities() {
+	for name, fn := range withMessaging.Activities() {
 		temporalkernel.RegisterActivity(w, name, fn)
 	}
 	log.Printf("worker polling task queue %q", temporalkernel.TaskQueue)

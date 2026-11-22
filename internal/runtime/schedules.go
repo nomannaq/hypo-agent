@@ -129,7 +129,9 @@ func (s Scheduler) createSchedule(ctx context.Context, runID, key string, args s
 	if err := json.Unmarshal(raw, &source); err != nil {
 		return Schedule{}, err
 	}
-	if !args.Repeat.Valid() || (args.Repeat != Once && source.Workflow != executor.RecurringWorkflowName) {
+	supportsRecurrence := source.Workflow == executor.RecurringWorkflowName ||
+		source.Workflow == executor.MessagingWorkflowName || source.Workflow == executor.DiscoveryWorkflowName
+	if !args.Repeat.Valid() || (args.Repeat != Once && !supportsRecurrence) {
 		return Schedule{}, errors.New("this run cannot create the requested recurrence")
 	}
 	if err := source.Skills.Validate(); err != nil {

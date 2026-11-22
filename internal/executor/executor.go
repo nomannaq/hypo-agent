@@ -113,6 +113,8 @@ const (
 	SchedulingWorkflowName = "agent-scheduling-v1"
 	ScheduledWorkflowName  = "agent-scheduled-v1"
 	RecurringWorkflowName  = "agent-recurring-v1"
+	MessagingWorkflowName  = "agent-messaging-v1"
+	DiscoveryWorkflowName  = "agent-discovery-v1"
 )
 
 // SystemPrompt is the agent's system prompt.
@@ -263,7 +265,7 @@ func (r *Runner) Workflow(c kernel.Ctx, input []byte) ([]byte, error) {
 // agent.Stopped.
 func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 	lim := r.limits()
-	if r.WorkflowType == SkillsWorkflowName || r.WorkflowType == SchedulingWorkflowName || r.WorkflowType == ScheduledWorkflowName || r.WorkflowType == RecurringWorkflowName || in.Skills != nil {
+	if r.WorkflowType == SkillsWorkflowName || r.WorkflowType == SchedulingWorkflowName || r.WorkflowType == ScheduledWorkflowName || r.WorkflowType == RecurringWorkflowName || r.WorkflowType == MessagingWorkflowName || r.WorkflowType == DiscoveryWorkflowName || in.Skills != nil {
 		if err := in.Skills.Validate(); err != nil {
 			return agent.State{}, fmt.Errorf("executor: %w", err)
 		}
@@ -277,6 +279,17 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 			n := t.Function.Name
 			return n == tool.AskUserName || n == tool.ResearchName || r.Tools.Effect(n) == tool.Write || slices.Contains(r.PrivateTools, n)
 		})
+	}
+	discovery := r.WorkflowType == DiscoveryWorkflowName && !in.Subagent
+	authorized := specs
+	available := map[string]bool{}
+	searches := 0
+	if discovery {
+		for _, spec := range authorized {
+			if tool.IsBaseTool(spec.Function.Name) {
+				available[spec.Function.Name] = true
+			}
+		}
 	}
 
 	s := agent.Start(in.History)
@@ -303,8 +316,11 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 		return s, err
 	}
 	system := r.System
-	if (r.WorkflowType == SchedulingWorkflowName || r.WorkflowType == RecurringWorkflowName) && !in.Subagent {
+	if (r.WorkflowType == SchedulingWorkflowName || r.WorkflowType == RecurringWorkflowName || r.WorkflowType == MessagingWorkflowName || discovery) && !in.Subagent {
 		system += "\nCurrent time in UTC is " + c.Now().UTC().Format(time.RFC3339) + "."
+	}
+	if discovery {
+		system += "\nUse the tools already offered when they fit. Use search_tools to find browser session controls, parallel research, memory or past chats, and scheduling. Search by task or exact tool name, then use the discovered tools on the next turn."
 	}
 	if in.Skills != nil {
 		system += in.Skills.Prompt()
@@ -340,6 +356,13 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 				}
 				continue
 			}
+			if discovery {
+				// Keep this snapshot unchanged until every call in the reply
+				// has been processed, even if a lookup adds tools meanwhile.
+				specs = slices.DeleteFunc(slices.Clone(authorized), func(spec model.Tool) bool {
+					return !available[spec.Function.Name]
+				})
+			}
 			req := model.Request{Messages: toModel(system, s.Messages), Tools: specs}
 			resp, err := kernel.Call(c, fmt.Sprintf("model/%d", s.Turns), modelActivity, req)
 			if err != nil {
@@ -372,6 +395,17 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 			switch {
 			case !offered(specs, call.Name):
 				res = toolResult{Output: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
+				if discovery {
+					res.Output = fmt.Sprintf("%q was not offered for this reply. Use search_tools if needed. Its results are available on the next turn.", call.Name)
+				}
+
+			case discovery && call.Name == tool.SearchToolsName:
+				searches++
+				if searches > 4 {
+					res = toolResult{Output: "Tool discovery budget used up. Continue with the tools already offered.", IsError: true}
+					break
+				}
+				res = discoverTools(call.Args, authorized, available)
 
 			case lim.Budgets[call.Name] > 0 && callsMade(s, call.Name) >= lim.Budgets[call.Name]:
 				res = toolResult{IsError: true, Output: fmt.Sprintf("Budget used up: a run may call %s %d times. "+
@@ -433,6 +467,26 @@ func (r *Runner) Run(c kernel.Ctx, in Input) (agent.State, error) {
 type toolResult struct {
 	Output  string `json:"output"`
 	IsError bool   `json:"is_error"`
+}
+
+func discoverTools(raw json.RawMessage, authorized []model.Tool, available map[string]bool) toolResult {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil || strings.TrimSpace(args.Query) == "" || len(args.Query) > 256 {
+		return toolResult{Output: "Give search_tools a nonempty query of at most 256 bytes.", IsError: true}
+	}
+	matches := tool.FindTools(args.Query, authorized)
+	if len(matches) == 0 {
+		return toolResult{Output: "No matching tools. Try browser session, parallel research, memory, or scheduling."}
+	}
+	var result strings.Builder
+	result.WriteString("Available on the next model call:\n")
+	for _, spec := range matches {
+		available[spec.Function.Name] = true
+		fmt.Fprintf(&result, "- %s: %s\n", spec.Function.Name, spec.Function.Description)
+	}
+	return toolResult{Output: strings.TrimSpace(result.String())}
 }
 
 // callTool runs one tool call as an activity. An unknown tool is answered

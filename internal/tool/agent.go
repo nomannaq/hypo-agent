@@ -14,14 +14,31 @@ import (
 // never called.
 
 const (
-	AskUserName  = "ask_user"
-	ResearchName = "research"
+	AskUserName     = "ask_user"
+	ResearchName    = "research"
+	SendMessageName = "send_message"
 
 	// MaxResearchTasks caps the subagents one research call starts.
 	MaxResearchTasks = 4
 )
 
 var errExecutorTool = errors.New("this tool is carried out by the executor, not called directly")
+
+// SendMessage publishes a standalone chat message while the run continues.
+func SendMessage() Tool {
+	return Typed(SendMessageName,
+		"Send a standalone message to the user while you keep working. Use it for a useful update, a verified finding, or a separate message the user requested. Your final reply ends the run.",
+		`{"type":"object","properties":{"text":{"type":"string","description":"User-facing plain text or Markdown","minLength":1}},"required":["text"]}`,
+		func(_ context.Context, in struct {
+			Text string `json:"text"`
+		}) (string, error) {
+			text := strings.TrimSpace(in.Text)
+			if text == "" || len(text) > 16<<10 {
+				return "", errors.New("send_message needs nonempty text of at most 16 KiB")
+			}
+			return text, nil
+		})
+}
 
 // AskUser returns ask_user: the run pauses until the user answers in the chat
 // (or the wait times out), and the answer is the tool's result.

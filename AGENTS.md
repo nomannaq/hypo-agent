@@ -406,7 +406,8 @@ scroll, wait, screenshot.
 
 ## Persistent memory
 
-New interactive runs use `agent-recurring-v1` and include the memory tools.
+New interactive runs use `agent-discovery-v1`. The model can look up the
+memory tools with `search_tools`.
 The worker retains prior workflow registrations for replay.
 Roll out the migration, then the new worker and server. Version information
 travels with the persisted run input, and child runs use the parent's workflow
@@ -489,6 +490,41 @@ returns no text, the chat receives the findings and review notes.
 
 The staged approach is adapted from the
 [HyperResearch workflow](https://github.com/jordan-gibbs/hyperresearch/blob/8f192b88bf777e2ad6da5e07e4b2ad7af40e2d7c/src/hyperresearch/skills/hyperresearch.md).
+
+## Assistant messages
+
+An interactive run can send a standalone chat message with
+`send_message {text}` and continue working. The worker journals it as an
+ordinary tool result. Text in a model reply also appears in chat, and a reply
+without tool calls completes the run. Research reports and scheduled replies
+use the same Markdown renderer.
+
+The Postgres function `run_assistant_messages` projects these messages from
+the event journal in sequence order. SSE includes the projected text as
+`assistant_message`. Reloaded chats and follow-up prompts use the same
+projection. Keep tool errors and other tool results out of the projection.
+Assistant Markdown supports tables, lists, and source links. The renderer
+drops raw HTML and remote images.
+
+Apply the assistant messages migration before deploying the server and
+worker. The worker keeps the prior workflow registrations for replay.
+
+## Tool discovery
+
+The top-level `agent-discovery-v1` workflow starts with seven tools.
+The model calls `search_tools {query}` for browser sessions, parallel
+research, memory, or schedules. The matcher searches the workflow's
+authorized catalog. It returns one group, whose schemas become available
+on the next model call and stay available for the rest of the run.
+The executor checks every call against the schemas offered to that reply.
+Discovered Write tools use the usual approval and ledger path.
+
+The workflow computes discovery from journaled model replies and
+persists the result as a tool event. Keep the starting list, catalog
+order, ranking, and four-attempt budget stable for this workflow version.
+Research children, Deep Research, and scheduled runs have fixed lists.
+Deploy workers with the new registration before routing new chat runs
+to it. See [tool discovery](.junie/plans/tool-discovery.md).
 
 ## Model gateway
 
