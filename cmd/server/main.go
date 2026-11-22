@@ -92,6 +92,7 @@ func main() {
 	mux.HandleFunc("GET /agent", s.authOnly(s.agentPage))
 	mux.HandleFunc("GET /schedules", s.authOnly(s.schedulesPage))
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.authOnly(s.cancelSchedule))
+	mux.HandleFunc("GET /api/chat/socket", s.chatSocket)
 	mux.HandleFunc("POST /api/runs", s.authOnly(s.startRun))
 	mux.HandleFunc("GET /api/runs/{id}/events", s.authOnly(s.runEvents))
 	mux.HandleFunc("POST /api/runs/{id}/approvals", s.authOnly(s.decideApproval))

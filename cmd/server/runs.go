@@ -30,24 +30,26 @@ const maxChatMessages = 100
 // checks whether its run died without a final event.
 const pingEvery = 15 * time.Second
 
-// startRun persists a request for the dispatcher. Older clients can still
-// send their own message history instead of selecting a conversation.
-func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		ConversationID string `json:"conversation_id"`
-		RequestID      string `json:"request_id"`
-		Prompt         string `json:"prompt"`
-		DeepResearch   bool   `json:"deep_research"`
-		Messages       []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
-	if !s.decode(w, r, &in) {
-		return
-	}
+// Older HTTP clients can still send their own message history.
+type runRequest struct {
+	ConversationID string               `json:"conversation_id"`
+	RequestID      string               `json:"request_id"`
+	Prompt         string               `json:"prompt"`
+	DeepResearch   bool                 `json:"deep_research"`
+	Messages       []chatHistoryMessage `json:"messages"`
+	InitialHistory []chatHistoryMessage `json:"initial_history"`
+}
+
+type chatHistoryMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+var errInvalidRun = errors.New("invalid run request")
+
+func (s *server) admitRun(ctx context.Context, owner int64, in runRequest) (runtime.Receipt, error) {
 	req := runtime.Request{
-		ID: "run-" + rand.Text(), Owner: currentUser(r).ID, RequestID: in.RequestID,
+		ID: "run-" + rand.Text(), Owner: owner, RequestID: in.RequestID,
 		Input: executor.Input{Workflow: executor.DiscoveryWorkflowName, Skills: s.skills},
 	}
 	if in.DeepResearch {
@@ -55,15 +57,13 @@ func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Messages != nil {
 		n := len(in.Messages)
-		if in.Prompt != "" || in.ConversationID != "" || in.RequestID != "" ||
+		if in.Prompt != "" || in.ConversationID != "" || in.RequestID != "" || len(in.InitialHistory) != 0 ||
 			n == 0 || n > maxChatMessages || in.Messages[n-1].Role != "user" {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
+			return runtime.Receipt{}, errInvalidRun
 		}
 		for _, m := range in.Messages {
 			if (m.Role != "user" && m.Role != "assistant") || strings.TrimSpace(m.Content) == "" {
-				http.Error(w, "bad request", http.StatusBadRequest)
-				return
+				return runtime.Receipt{}, errInvalidRun
 			}
 		}
 		for _, m := range in.Messages[:n-1] {
@@ -74,16 +74,39 @@ func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
 		req.Input.Prompt = strings.TrimSpace(in.Prompt)
 		if req.Input.Prompt == "" || len(req.Input.Prompt) > 32<<10 ||
 			len(in.ConversationID) > 64 || len(in.RequestID) > 64 || strings.TrimSpace(in.RequestID) == "" {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
+			return runtime.Receipt{}, errInvalidRun
 		}
 		req.ConversationID = in.ConversationID
+		if len(in.InitialHistory) > 0 {
+			if req.ConversationID != "" || len(in.InitialHistory) >= maxChatMessages {
+				return runtime.Receipt{}, errInvalidRun
+			}
+			var size int
+			for _, m := range in.InitialHistory {
+				size += len(m.Content)
+				if size > 128<<10 || (m.Role != "user" && m.Role != "assistant") || strings.TrimSpace(m.Content) == "" {
+					return runtime.Receipt{}, errInvalidRun
+				}
+				req.Input.History = append(req.Input.History, agent.Message{Role: agent.Role(m.Role), Text: m.Content})
+			}
+		}
 		if req.ConversationID == "" {
 			req.NewConversationID = "chat-" + rand.Text()
 		}
 	}
-	receipt, err := s.scheduler.Admit(r.Context(), req)
+	return s.scheduler.Admit(ctx, req)
+}
+
+func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
+	var in runRequest
+	if !s.decode(w, r, &in) {
+		return
+	}
+	receipt, err := s.admitRun(r.Context(), currentUser(r).ID, in)
+
 	switch {
+	case errors.Is(err, errInvalidRun):
+		http.Error(w, "bad request", http.StatusBadRequest)
 	case errors.Is(err, runtime.ErrQueueFull):
 		http.Error(w, err.Error(), http.StatusTooManyRequests)
 	case errors.Is(err, runtime.ErrMissingConversation):
@@ -235,14 +258,37 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return
+	}
+	s.followRun(ctx, id, after, func(frame runFrame) error {
+		switch frame.Type {
+		case "event":
+			data, _ := json.Marshal(frame.Event)
+			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", frame.Seq, data)
+		case "end":
+			fmt.Fprint(w, "event: end\ndata: {}\n\n")
+		case "error":
+			data, _ := json.Marshal(frame.Error)
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
+		case "ping":
+			fmt.Fprint(w, ": ping\n\n")
+		}
+		return rc.Flush()
+	})
+}
+
+// followRun replays the durable journal and then tails it. Transport callbacks
+// are synchronous to preserve event order within a run.
+func (s *server) followRun(ctx context.Context, id string, after int, send func(runFrame) error) {
 	// Subscribe before the first read, so an event landing in between still
 	// wakes this stream.
 	wake, unsubscribe := s.hub.subscribe(id)
 	defer unsubscribe()
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	rc := http.NewResponseController(w)
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 
@@ -287,27 +333,24 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			next++
 			if seq > after {
-				data, _ := json.Marshal(struct {
-					agent.Event
-					AssistantMessage string `json:"assistant_message,omitempty"`
-				}{e, message})
-				fmt.Fprintf(w, "id: %d\ndata: %s\n\n", seq, data)
+				if err := send(runFrame{Type: "event", RunID: id, Seq: seq, Event: &publicRunEvent{e, message}}); err != nil {
+					rows.Close()
+					return
+				}
 			}
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("run %s: scanning events: %v", id, err)
+			return
+		}
 
 		switch {
 		case st.Status == agent.Done || st.Status == agent.Stopped:
-			fmt.Fprint(w, "event: end\ndata: {}\n\n")
-			_ = rc.Flush()
+			_ = send(runFrame{Type: "end", RunID: id})
 			return
 		case stopped:
-			data, _ := json.Marshal(failure)
-			fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
-			_ = rc.Flush()
-			return
-		}
-		if err := rc.Flush(); err != nil {
+			_ = send(runFrame{Type: "error", RunID: id, Error: failure})
 			return
 		}
 
@@ -316,7 +359,9 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-wake:
 		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
+			if err := send(runFrame{Type: "ping", RunID: id}); err != nil {
+				return
+			}
 			checkRun = true
 		}
 	}

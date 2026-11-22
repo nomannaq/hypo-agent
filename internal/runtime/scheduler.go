@@ -28,6 +28,8 @@ var (
 	ErrWorkflowMissing     = errors.New("workflow does not exist")
 )
 
+const dispatchLock = 60261122
+
 type Scheduler struct {
 	DB      *pgxpool.Pool
 	Start   func(ctx context.Context, id string, input []byte) error
@@ -124,9 +126,9 @@ func admitRun(ctx context.Context, tx pgx.Tx, req Request) (Receipt, error) {
 	if err != nil {
 		return Receipt{}, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO agent_runs (id, user_id, conversation_id, request_id, status, prompt, workflow_input)
-		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7)`,
-		req.ID, owner, chat, req.RequestID, Queued.String(), req.Input.Prompt, input)
+	_, err = tx.Exec(ctx, `INSERT INTO agent_runs (id, user_id, conversation_id, request_id, status, prompt, workflow_input, background_research)
+		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8)`,
+		req.ID, owner, chat, req.RequestID, Queued.String(), req.Input.Prompt, input, executor.IsDeepResearchWorkflow(req.Input.Workflow))
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -175,7 +177,7 @@ func (s Scheduler) claim(ctx context.Context) (string, []byte, error) {
 
 	// ponytail: serialize the short capacity reservation across dispatchers.
 	// Per-user dispatch locks become worthwhile if reservation is a bottleneck.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(60261122)"); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", dispatchLock); err != nil {
 		return "", nil, err
 	}
 	var id, prompt, chat string
@@ -184,7 +186,11 @@ func (s Scheduler) claim(ctx context.Context) (string, []byte, error) {
 	err = tx.QueryRow(ctx, `SELECT r.id, r.prompt, COALESCE(r.conversation_id, ''), r.ordinal, r.workflow_input
 		FROM agent_runs r
 		WHERE r.status = $1
-		AND NOT EXISTS (SELECT 1 FROM agent_runs active WHERE active.conversation_id = r.conversation_id AND active.status IN ($2, $3))
+		AND NOT EXISTS (SELECT 1 FROM agent_runs active WHERE active.conversation_id = r.conversation_id AND active.status IN ($2, $3)
+			AND active.background_research = r.background_research)
+		AND (NOT r.background_research OR NOT EXISTS (
+			SELECT 1 FROM agent_runs active WHERE active.user_id = r.user_id
+			AND active.status IN ($2, $3) AND active.background_research))
 		AND (SELECT count(*) FROM agent_runs active WHERE active.user_id = r.user_id AND active.status IN ($2, $3)) < $4
 		ORDER BY r.ordinal LIMIT 1 FOR UPDATE OF r`, Queued.String(), Starting.String(), Running.String(), maxActive,
 	).Scan(&id, &prompt, &chat, &ordinal, &input)
@@ -199,11 +205,25 @@ func (s Scheduler) claim(ctx context.Context) (string, []byte, error) {
 			}
 		}
 		if request.Workflow != executor.ScheduledWorkflowName {
-			request.History, err = chatHistory(ctx, tx, chat, ordinal)
+			history, err := chatHistory(ctx, tx, chat, ordinal)
 			if err != nil {
 				return "", nil, err
 			}
+			// A first saved turn can carry context from the legacy tab chat.
+			if len(history) > 0 {
+				request.History = history
+			}
 		}
+		if request.Workflow == executor.OrchestratorWorkflowName {
+			if err := tx.QueryRow(ctx, `SELECT ARRAY(
+				SELECT left(prompt, 1000) FROM agent_runs
+				WHERE conversation_id = $1 AND ordinal < $2 AND background_research AND status IN ($3, $4)
+				ORDER BY ordinal
+			)`, chat, ordinal, Starting.String(), Running.String()).Scan(&request.ActiveResearch); err != nil {
+				return "", nil, err
+			}
+		}
+
 		input, err = json.Marshal(request)
 		if err != nil {
 			return "", nil, err
@@ -220,6 +240,30 @@ func (s Scheduler) claim(ctx context.Context) (string, []byte, error) {
 		return "", nil, err
 	}
 	return id, input, tx.Commit(ctx)
+}
+
+// YieldResearch moves an active turn into the account's background research
+// slot. It uses the same lock as claim so no dispatcher can fill a competing
+// slot during the move. Retrying a successful yield returns true.
+func (s Scheduler) YieldResearch(ctx context.Context, id string) (bool, error) {
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", dispatchLock); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE agent_runs r SET background_research = TRUE
+		WHERE r.id = $1 AND r.status IN ($2, $3)
+		AND (r.background_research OR NOT EXISTS (
+			SELECT 1 FROM agent_runs active WHERE active.user_id = r.user_id
+			AND active.status IN ($2, $3) AND active.background_research))`,
+		id, Starting.String(), Running.String())
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, tx.Commit(ctx)
 }
 
 func chatHistory(ctx context.Context, tx pgx.Tx, chat string, before int64) ([]agent.Message, error) {
