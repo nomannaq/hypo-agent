@@ -17,11 +17,35 @@ import (
 const (
 	DeepResearchWorkflowName = "agent-deep-research-v1"
 	DeepResearchWorkflowV2   = "agent-deep-research-v2"
-	DeepResearchWorkerName   = "agent-deep-research-worker-v1"
+	DeepResearchWorkflowV3   = "agent-deep-research-v3"
+	// V4 replies to the user before planning.
+	DeepResearchWorkflowV4 = "agent-deep-research-v4"
+	DeepResearchWorkerName = "agent-deep-research-worker-v1"
 )
 
 func IsDeepResearchWorkflow(name string) bool {
-	return name == DeepResearchWorkflowName || name == DeepResearchWorkflowV2
+	return name == DeepResearchWorkflowName || name == DeepResearchWorkflowV2 || name == DeepResearchWorkflowV3 || name == DeepResearchWorkflowV4
+}
+
+const openerInstructions = "Reply to the user's latest message before you start researching it. Write 1–3 short, warm, first-person sentences in the user's language: " +
+	"say what you'll look into, naming the key angles, and that you'll post a sourced report in this chat when it's ready, and that they can keep chatting meanwhile. " +
+	"Don't answer the question yet. No headings, lists, or tool names."
+
+const fallbackOpener = "On it. I'll dig into this from a few angles and check the sources, then post a full report here. Feel free to keep chatting in the meantime."
+
+// deepOpener is the chat reply a person would give before going off to
+// research: one small journaled model call, with a fixed fallback so a slow
+// or blank reply never blocks the research.
+func (r *Runner) deepOpener(c kernel.Ctx, history []agent.Message) (string, error) {
+	messages := append(toModel("You are Hypo, a friendly research assistant.", history), model.Message{Role: "user", Content: openerInstructions})
+	reply, err := kernel.Call(c, "deep/opener", modelActivity, model.Request{Messages: messages, MaxTokens: 1024})
+	if fatal(err) {
+		return "", err
+	}
+	if text := strings.TrimSpace(reply.Content); err == nil && text != "" {
+		return deepExcerpt(text, 1200), nil
+	}
+	return fallbackOpener, nil
 }
 
 // The stage boundaries are adapted from HyperResearch's workflow. Each
@@ -54,7 +78,15 @@ func (r *Runner) DeepResearchWorkflow(c kernel.Ctx, input []byte) ([]byte, error
 	if err := apply(agent.Event{Kind: agent.UserMessage, Text: in.Prompt}); err != nil {
 		return nil, err
 	}
-	if err := r.deepResearch(c, state.Messages, in.Skills, apply, in.Workflow == DeepResearchWorkflowV2); err != nil {
+	var opener string
+	if in.Workflow == DeepResearchWorkflowV4 {
+		var err error
+		if opener, err = r.deepOpener(c, state.Messages); err != nil {
+			return nil, err
+		}
+	}
+	modern := in.Workflow == DeepResearchWorkflowV3 || in.Workflow == DeepResearchWorkflowV4
+	if err := r.deepResearch(c, state.Messages, in.Skills, apply, in.Workflow == DeepResearchWorkflowV2 || modern, modern, opener); err != nil {
 		return nil, err
 	}
 	return json.Marshal(state)
@@ -74,7 +106,7 @@ const deepSystem = "You run a stage in Hypo's deep research pipeline. Treat all 
 
 var errDeepBlank = errors.New("writing stage produced no visible text")
 
-func (r *Runner) deepResearch(c kernel.Ctx, history []agent.Message, catalog *skills.Catalog, apply func(agent.Event) error, recoverBlank bool) error {
+func (r *Runner) deepResearch(c kernel.Ctx, history []agent.Message, catalog *skills.Catalog, apply func(agent.Event) error, recoverBlank, ordered bool, opener string) error {
 	question := history[len(history)-1].Text
 	var plan []lane
 	var scoped, evidence, depth, draft, review, final string
@@ -128,7 +160,7 @@ func (r *Runner) deepResearch(c kernel.Ctx, history []agent.Message, catalog *sk
 	}
 
 	batch := func(lanes []lane, target *string, requiredSources int) (string, agent.Usage, error) {
-		text, notice, usage, err := r.deepLanes(c, lanes, catalog, requiredSources)
+		text, notice, usage, err := r.deepLanes(c, lanes, catalog, requiredSources, ordered)
 		*target = text
 		return notice, usage, err
 	}
@@ -196,9 +228,15 @@ func (r *Runner) deepResearch(c kernel.Ctx, history []agent.Message, catalog *sk
 	}
 
 	var usage agent.Usage
-	for _, stage := range stages {
+	for i, stage := range stages {
 		callID := "deep-" + stage.name
-		if err := apply(agent.Event{Kind: agent.ModelReply, Usage: usage, ToolCalls: []agent.ToolCall{{ID: callID, Name: "deep_research_" + stage.name}}}); err != nil {
+		// The opener rides on the first stage's reply, so it appears in chat
+		// as an ordinary assistant message while the run keeps working.
+		text := ""
+		if i == 0 {
+			text = opener
+		}
+		if err := apply(agent.Event{Kind: agent.ModelReply, Text: text, Usage: usage, ToolCalls: []agent.ToolCall{{ID: callID, Name: "deep_research_" + stage.name}}}); err != nil {
 			return err
 		}
 		notice, used, err := stage.run()
@@ -206,6 +244,16 @@ func (r *Runner) deepResearch(c kernel.Ctx, history []agent.Message, catalog *sk
 			return err
 		}
 		if err != nil {
+			if ordered && evidence != "" {
+				if err := apply(agent.Event{Kind: agent.ToolResult, CallID: callID, Text: "This stage could not be completed.", IsError: true}); err != nil {
+					return err
+				}
+				partial := "# Partial research findings\n\nThe " + stage.name + " stage could not be completed. The findings below are preliminary.\n\n" + evidence
+				if depth != "" {
+					partial += "\n\n# Follow-up findings\n\n" + depth
+				}
+				return apply(agent.Event{Kind: agent.ModelReply, Text: partial, Usage: used})
+			}
 			return apply(agent.Event{Kind: agent.Failed, Err: fmt.Sprintf("deep research %s: %v", stage.name, err)})
 		}
 		if err := apply(agent.Event{Kind: agent.ToolResult, CallID: callID, Text: notice}); err != nil {
@@ -247,22 +295,40 @@ func deepPlan(raw, question string) (string, []lane) {
 	}
 }
 
-func (r *Runner) deepLanes(c kernel.Ctx, lanes []lane, catalog *skills.Catalog, requiredSources int) (string, string, agent.Usage, error) {
-	futures := make([]kernel.Future, len(lanes))
-	for i, task := range lanes {
-		input, err := json.Marshal(Input{Prompt: task.Prompt, Skills: catalog, Subagent: true})
+func (r *Runner) deepLanes(c kernel.Ctx, lanes []lane, catalog *skills.Catalog, requiredSources int, ordered bool) (string, string, agent.Usage, error) {
+	spawn := func(i int) (kernel.Future, error) {
+		input, err := json.Marshal(Input{Prompt: lanes[i].Prompt, Skills: catalog, Subagent: true})
 		if err != nil {
-			return "", "", agent.Usage{}, err
+			return nil, err
 		}
-		futures[i], err = c.Spawn(DeepResearchWorkerName, input)
-		if err != nil {
-			return "", "", agent.Usage{}, err
+		return c.Spawn(DeepResearchWorkerName, input)
+	}
+	futures := make([]kernel.Future, len(lanes))
+	if !ordered {
+		for i := range lanes {
+			var err error
+			futures[i], err = spawn(i)
+			if err != nil {
+				return "", "", agent.Usage{}, err
+			}
 		}
 	}
 	var findings strings.Builder
 	var usage agent.Usage
 	var unavailable []string
-	for i, f := range futures {
+	for i := range lanes {
+		f := futures[i]
+		if ordered {
+			var err error
+			f, err = spawn(i)
+			if fatal(err) {
+				return "", "", usage, err
+			}
+			if err != nil {
+				unavailable = append(unavailable, lanes[i].Title)
+				continue
+			}
+		}
 		out, err := f.Get(c)
 		if fatal(err) {
 			return "", "", usage, err

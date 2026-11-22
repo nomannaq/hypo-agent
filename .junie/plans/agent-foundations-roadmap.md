@@ -106,7 +106,8 @@ The web agent page shows real streamed agent output instead of the fake reply.
 - ✓ Add `run_events` migration and event persistence (`events.append` activity, `(run_id, seq)` key, insert trigger → `NOTIFY`).
 - ✓ Add server endpoints to start a run and stream via SSE with Last-Event-ID resume; runs are owned by the user who started them.
 - ✓ Replace the blocking `/api/chat` in `web/src/pages/agent.tsx`; render model and tool steps with `AgentActivity`; reattach after a reload.
-- Later: token-by-token text (a non-durable side channel; activities only return final results), and conversations stored server-side instead of sessionStorage.
+- ✓ Saved conversations stream through one WebSocket per open chat. Prompts can queue while the agent works, and each queued turn sees the preceding completed turns. The HTTP/SSE run endpoints remain available.
+- Later: token-by-token text (activities return complete results).
 
 ### * Step 4: Durable execution on Temporal
 Runs survive worker crashes and pass the conformance and chaos tests.
@@ -115,6 +116,7 @@ Runs survive worker crashes and pass the conformance and chaos tests.
 - Durable admission, concurrent-run caps, and workflow reconciliation are implemented in `internal/runtime`. The scheduler integration test passed on Postgres 17.
 - One-shot, daily, and weekly user schedules deliver durable runs to the original conversation. Account-level spend controls are follow-up work.
 - ✓ Add kill-worker chaos test.
+- ✓ Separate foreground chat from background research and join new research subagents in plan order.
 
 Runs from `POST /api/runs` execute on Temporal via `cmd/worker`. Both kernels pass conformance, and the Temporal chaos test covers worker loss. The proposed delivery order for durable admission, supervision, memory, skills, and scheduled runs is in [Memory, skills, and scheduling](memory-skills-and-scheduling.md).
 

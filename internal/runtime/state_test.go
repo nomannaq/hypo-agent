@@ -7,6 +7,9 @@ import (
 
 func TestLifecycleTransitions(t *testing.T) {
 	want := map[[2]uint8]Status{
+		{uint8(Queued), uint8(UserCancelled)}:     Failed,
+		{uint8(Starting), uint8(UserCancelled)}:   Failed,
+		{uint8(Running), uint8(UserCancelled)}:    Failed,
 		{uint8(Queued), uint8(DispatchClaimed)}:   Starting,
 		{uint8(Starting), uint8(WorkflowStarted)}: Running,
 		{uint8(Starting), uint8(AgentSucceeded)}:  Succeeded,

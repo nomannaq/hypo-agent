@@ -73,7 +73,7 @@ func main() {
 		log.Fatalf("loading skills: %v", err)
 	}
 	s := &server{db: db, app: app, temporal: tc, hub: newHub(), skills: catalog}
-	s.scheduler = runtime.Scheduler{DB: db, Start: s.startWorkflow, Inspect: s.inspectWorkflow}
+	s.scheduler = runtime.Scheduler{DB: db, Start: s.startWorkflow, Inspect: s.inspectWorkflow, ClosedReason: s.workflowCloseReason, CancelWorkflow: s.cancelWorkflow}
 	go s.scheduler.Dispatch(context.Background())
 	go s.scheduler.Supervise(context.Background())
 	go s.scheduler.DispatchSchedules(context.Background())
@@ -92,8 +92,10 @@ func main() {
 	mux.HandleFunc("GET /agent", s.authOnly(s.agentPage))
 	mux.HandleFunc("GET /schedules", s.authOnly(s.schedulesPage))
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.authOnly(s.cancelSchedule))
+	mux.HandleFunc("GET /api/chat/socket", s.chatSocket)
 	mux.HandleFunc("POST /api/runs", s.authOnly(s.startRun))
 	mux.HandleFunc("GET /api/runs/{id}/events", s.authOnly(s.runEvents))
+	mux.HandleFunc("POST /api/runs/{id}/cancel", s.authOnly(s.requestRunCancellation))
 	mux.HandleFunc("POST /api/runs/{id}/approvals", s.authOnly(s.decideApproval))
 	mux.HandleFunc("GET /api/runs/{id}/artifacts/{artifact}", s.authOnly(s.artifact))
 	mux.Handle("GET /settings", http.RedirectHandler("/settings/profile", http.StatusFound))
