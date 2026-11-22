@@ -28,6 +28,13 @@ type chatCommand struct {
 	After *int   `json:"after"`
 }
 
+type runLifecycle struct {
+	Status             string `json:"status"`
+	BackgroundResearch bool   `json:"background_research"`
+	CancelRequested    bool   `json:"cancel_requested"`
+	WaitingFor         string `json:"waiting_for,omitempty"`
+}
+
 type runFrame struct {
 	Type           string          `json:"type"`
 	RunID          string          `json:"run_id,omitempty"`
@@ -35,6 +42,7 @@ type runFrame struct {
 	ConversationID string          `json:"conversation_id,omitempty"`
 	Seq            int             `json:"seq"`
 	Event          *publicRunEvent `json:"event,omitempty"`
+	Lifecycle      *runLifecycle   `json:"lifecycle,omitempty"`
 	Error          string          `json:"error,omitempty"`
 }
 
