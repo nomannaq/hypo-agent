@@ -36,7 +36,7 @@ Inertia (gonertia) + React 19 + Tailwind 4 frontend, Nebius Token Factory
 | `internal/kernel/conformance` | **Done**: 8 tests, run against both kernels, mutation-checked |
 | `internal/model`: Nebius client | **Done**: tool calling, retry/backoff, `OnUsage` metering, live smoke test |
 | `internal/executor`: agent loop | **Done**: guards, crash-resume test |
-| `cmd/server`: auth, sessions, runs | **Done**: `POST /api/runs` starts a durable run; `GET /api/runs/{id}/events` streams its events (SSE) |
+| `cmd/server`: auth, sessions, runs | **Done**: the chat socket queues durable runs and streams events; the HTTP and SSE run API is also available |
 | `cmd/worker` | **Done**: runs agent workflows and activities, persists run events; survives being killed mid-run |
 | Web UI: beUI chat shell, orb, messages, activity | **Done**: follows runs step by step, reattaches after a reload |
 | `internal/tool` | **Registry and effects**: web (`web_search`, `browse`), a per-run browser session (`browser_open`, `_snapshot`, `_click`, `_type`, `_select`, `_press`, `_scroll`, `_back`, `_wait`, `_screenshot`), run tools (`todo_write`, `ask_user`, `research` subagents), and memory tools. Sandbox is a stub |
@@ -57,9 +57,9 @@ of the [memory, skills, and scheduling plan](.junie/plans/memory-skills-and-sche
 ## Architecture
 
 ```
-web (React/Inertia) ──POST /api/runs──▶ cmd/server ──start workflow──▶ Temporal
-        ▲                                   ▲                          │
-        └──SSE /api/runs/{id}/events────────┤ LISTEN run_events        │
+web (React/Inertia) ◀──WebSocket──────▶ cmd/server ──start workflow──▶ Temporal
+                                             │                          │
+                                      LISTEN run_events                 │
                                                          cmd/worker (polls hypo-agent)
                                                                        │
                                                kernel.Ctx = temporalkernel
@@ -71,48 +71,48 @@ web (React/Inertia) ──POST /api/runs──▶ cmd/server ──start workflo
 ```
 
 Each run's events land in `run_events` (written by the worker's
-`events.append` activity) and reach the UI over SSE. The runtime scheduler
+`events.append` activity) and reach the UI through `GET /api/chat/socket`. The runtime scheduler
 admits and supervises runs. The memory tools are available to new chat runs.
 
 ### Request flow today
 
-1. `web/src/pages/agent.tsx` posts a prompt, a request ID, and the selected
-   conversation to `POST /api/runs`. The first turn creates the conversation.
-   Legacy clients can send their message history.
+1. `web/src/pages/agent.tsx` sends a `submit` frame with a prompt, a request
+   ID, and the selected conversation. The first acknowledged turn creates
+   the conversation. The composer stays open while the agent works.
 2. `internal/runtime` commits the queued run and returns its ID. The server's
    dispatcher claims it in Postgres, saves the workflow input assembled from
    completed turns, and starts its registered workflow on Temporal (task queue
    `hypo-agent`, workflow ID = application run ID). Admission bounds each user
    to 10 queued and two active runs, with one active run per conversation.
-3. The page opens `GET /api/runs/{id}/events` (an `EventSource`).
+3. The page sends a `watch` frame for each queued or active run on the same socket.
 4. `cmd/worker` runs it: `executor.Run` folds events through `agent.Reduce`,
    calling the model (and tools, once there are any) as activities until the
    state is `done` or `failed`. After every event it calls the
    `events.append` activity, which inserts `(run_id, seq, event)` into
    `run_events`; an insert trigger sends `NOTIFY run_events`.
 5. The server holds one `LISTEN run_events` connection (`hub` in `runs.go`)
-   and wakes the run's streams, which re-read the table and send new events as
-   `id: <seq>` / `data: <agent.Event>`. Each stream folds what it sends
-   through `agent.Reduce` and closes with `event: end` once the run is `done`
-   or `failed`.
+   and wakes subscribers. Subscribers read the journal in sequence order
+   and deliver an `event` frame with `run_id` and `seq`. The chat shows
+   queue state, thinking, the current tool step, and each public assistant
+   message. An `end` frame ends the subscription when the run finishes.
 
 The run lives on the worker, not in the request. If the worker dies mid-call,
 the activity's heartbeat stops, Temporal notices within the heartbeat timeout
 (20s) and retries the call on another worker; completed calls are replayed
-from history, not repeated. If the browser disconnects, `EventSource`
-reconnects with `Last-Event-ID` and gets only what it missed; after a reload
-the page restores the conversation from Postgres and reattaches to queued
-and active runs. Old tab-local chats can still be opened from `/agent`.
-The supervisor checks Temporal independently of SSE. A final event and its
+from history, not repeated. After a WebSocket disconnect, the client resends
+unacknowledged submits with the same request ID and resumes watches from
+their last seen sequence. On reload it reattaches to queued and active runs
+from Postgres. Old tab-local chats can still be opened from `/agent`.
+The supervisor checks Temporal independently of the socket. A final event and its
 terminal runtime state commit together. When a workflow closes without a
-final event, the supervisor releases its slot and the stream sends
-`event: error`. `memkernel` is used only in tests.
+final event, the supervisor releases its slot and subscribers receive an
+error frame. `memkernel` is used only in tests.
 
 ## Repo map
 
 ```
 cmd/
-  server/          HTTP + Inertia app: auth, sessions, settings, runs + SSE, `seed` subcommand
+  server/          HTTP + Inertia app: auth, sessions, settings, run WebSocket and HTTP/SSE, `seed` subcommand
   migrate/         goose CLI (migrations embedded from db/)
   worker/          Temporal worker: the agent workflow + its activities
   browser-sessions/ Local service that keeps live tabs across worker restarts
@@ -477,7 +477,7 @@ and research subagents. The task result streams to the original chat.
 The prompt composer sends `deep_research: true` to `POST /api/runs`. Admission
 pins `agent-deep-research-v2` in the saved input. The worker retains v1 for replay. The workflow checkpoints
 planning, parallel collection, targeted follow-up, drafting, independent
-review, and the revised report. Progress reaches the existing SSE stream
+review, and the revised report. Progress reaches the existing event stream
 through named research-stage events represented as tool calls and results.
 
 Investigation and citation-review workers use read-only browser tools and
@@ -501,7 +501,7 @@ without tool calls completes the run. Research reports and scheduled replies
 use the same Markdown renderer.
 
 The Postgres function `run_assistant_messages` projects these messages from
-the event journal in sequence order. SSE includes the projected text as
+the event journal in sequence order. The run feed includes projected text as
 `assistant_message`. Reloaded chats and follow-up prompts use the same
 projection. Keep tool errors and other tool results out of the projection.
 Assistant Markdown supports tables, lists, and source links. The renderer

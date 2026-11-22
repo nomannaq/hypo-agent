@@ -48,7 +48,7 @@ func runtimeTestDB(t *testing.T, migrations ...string) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	base := []string{"20261119191023_create_users.sql", "20261120223657_create_run_events.sql", "20261122004308_durable_conversations.sql"}
-	base = append(base, "20261122014500_assistant_messages.sql")
+	base = append(base, "20261122014500_assistant_messages.sql", "20261122015500_research_lane.sql")
 	for _, name := range append(base, migrations...) {
 		sql, err := db.Migrations.ReadFile("migrations/" + name)
 		if err != nil {

@@ -131,7 +131,7 @@ type Turn = {
     messages?: string[];
     runId?: string;
     events?: AgentEvent[];
-    status?: 'working' | 'done' | 'error';
+    status?: 'queued' | 'working' | 'done' | 'error';
     seconds?: number; // how long the run took
 };
 
@@ -144,13 +144,15 @@ const loadTurns = (): Turn[] => {
         );
         // Reloaded before the run was started: there is nothing to reattach to.
         return turns.map((t) =>
-            t.status === 'working' && !t.runId
+            (t.status === 'working' || t.status === 'queued') && !t.runId
                 ? {
                       ...t,
                       status: 'error',
                       text: 'The page reloaded before the run started.',
                   }
-                : t,
+                : t.status === 'working' || t.status === 'queued'
+                  ? { ...t, events: [], messages: [] }
+                  : t,
         );
     } catch {
         return [];
@@ -190,7 +192,9 @@ const restoreRuns = (runs: StoredRun[]): Turn[] =>
                     ? 'done'
                     : run.status === 'failed'
                       ? 'error'
-                      : 'working',
+                      : run.status === 'queued' || run.status === 'starting'
+                        ? 'queued'
+                        : 'working',
         },
     ]);
 
@@ -236,32 +240,25 @@ function AssistantMarkdown({ text }: { text: string }) {
     );
 }
 
-const startRun = async (
-    request: { deep_research: boolean } & (
-        | { messages: { role: 'user' | 'assistant'; content: string }[] }
-        | { prompt: string; request_id: string; conversation_id: string }
-    ),
-    signal: AbortSignal,
-) => {
-    const send = () =>
-        fetch('/api/runs', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(request),
-            signal,
-        });
-    const res = await send().catch((err: unknown) => {
-        if ('request_id' in request && !signal.aborted) return send();
-        throw err;
-    });
-    if (!res.ok) {
-        throw new Error(
-            res.status === 429
-                ? 'Your run queue is full. Try again when a run finishes.'
-                : 'The agent could not start. Please try again.',
-        );
-    }
-    return (await res.json()) as { id: string; conversation_id?: string };
+type ChatFrame =
+    | {
+          type: 'accepted';
+          request_id: string;
+          run_id: string;
+          conversation_id: string;
+      }
+    | { type: 'rejected'; request_id: string; error: string }
+    | { type: 'event'; run_id: string; seq: number; event: AgentEvent }
+    | { type: 'end'; run_id: string }
+    | { type: 'error'; run_id: string; error?: string }
+    | { type: 'ping' | 'pong' };
+
+type QueuedPrompt = {
+    replyId: number;
+    prompt: string;
+    deepResearch: boolean;
+    sentOn?: WebSocket;
+    initialHistory?: { role: Turn['from']; content: string }[];
 };
 
 // The run's requests to the user (approval_requested): Write calls to
@@ -452,6 +449,38 @@ export default function Agent(props: AgentProps) {
     );
 }
 
+function RunActivity({ turn, connected }: { turn: Turn; connected: boolean }) {
+    if (turn.status === 'queued') {
+        return (
+            <p role="status" className="text-sm text-muted-foreground">
+                {turn.runId
+                    ? 'Queued'
+                    : connected
+                      ? 'Sending…'
+                      : 'Waiting for connection…'}
+            </p>
+        );
+    }
+    const working = turn.status === 'working';
+    const items = activityItems(turn.events ?? [], working);
+    const activeTool = items.findLast(
+        (item) =>
+            item.type === 'step' &&
+            item.status === 'active' &&
+            item.id.startsWith('tool-'),
+    );
+    return (
+        <AgentActivity
+            items={items}
+            activeLabel={
+                activeTool?.type === 'step' ? activeTool.label : undefined
+            }
+            status={working ? 'working' : 'complete'}
+            duration={turn.seconds ?? 0}
+        />
+    );
+}
+
 function Chat({
     conversationID,
     runs,
@@ -469,13 +498,29 @@ function Chat({
         legacy ? loadTurns() : restoreRuns(runs),
     );
     const nextId = useRef(Math.max(0, ...turns.map((t) => t.id + 1)));
-    const loading = turns.some((t) => t.status === 'working');
-    const streams = useRef(new Set<EventSource>());
-    const submitting = useRef<AbortController | null>(null);
+    const [legacyLimit] = useState(() =>
+        Math.max(0, ...turns.map((t) => t.id + 1)),
+    );
+    const loading = turns.some(
+        (t) => t.status === 'working' || t.status === 'queued',
+    );
+    const socket = useRef<WebSocket | null>(null);
+    const chat = useRef(conversationID);
+    const pending = useRef(new Map<string, QueuedPrompt>());
+    const watches = useRef(
+        new Map<string, { replyId: number; after: number; started?: number }>(),
+    );
+    const navigating = useRef(false);
+    const [changingChat, setChangingChat] = useState(false);
+    const [connected, setConnected] = useState(false);
 
     useEffect(() => {
-        if (legacy) sessionStorage.setItem(STORAGE_KEY, JSON.stringify(turns));
-    }, [legacy, turns]);
+        if (legacy)
+            sessionStorage.setItem(
+                STORAGE_KEY,
+                JSON.stringify(turns.filter((turn) => turn.id < legacyLimit)),
+            );
+    }, [legacy, legacyLimit, turns]);
 
     // The orb breathes quietly at rest and pulses while the agent works.
     const activity = useMotionValue(0.06);
@@ -521,149 +566,219 @@ function Chat({
     const update = (id: number, f: (t: Turn) => Turn) =>
         setTurns((ts) => ts.map((t) => (t.id === id ? f(t) : t)));
 
-    // follow streams a run's events into the reply turn until the run ends.
-    // The server replays the run from its first event, so a reattach starts
-    // from an empty list; EventSource's own reconnects resume via Last-Event-ID.
-    const follow = (replyId: number, runId: string) => {
-        const started = performance.now();
-        const seconds = () => Math.round((performance.now() - started) / 1000);
-        const open = streams.current;
-        const es = new EventSource(
-            `/api/runs/${encodeURIComponent(runId)}/events`,
-        );
-        open.add(es);
-        const close = () => {
-            es.close();
-            open.delete(es);
-        };
-        update(replyId, (t) => ({ ...t, events: [], messages: [] }));
-        es.onmessage = (m) => {
-            const e = JSON.parse(m.data) as AgentEvent;
-            update(replyId, (t) => ({
-                ...t,
-                events: [...(t.events ?? []), e],
-                messages: e.assistant_message
-                    ? [...(t.messages ?? []), e.assistant_message]
-                    : t.messages,
-                text:
-                    e.kind === 'failed' ? `The run stopped: ${e.err}` : t.text,
-            }));
-        };
-        es.addEventListener('end', () => {
-            close();
-            update(replyId, (t) => ({
-                ...t,
-                status: t.events?.at(-1)?.kind === 'failed' ? 'error' : 'done',
-                seconds: seconds(),
-            }));
-        });
-        // Fired for the server's `event: error` and for a connection that
-        // can't recover (404, logged out). Transient drops reconnect on their own.
-        es.addEventListener('error', (e) => {
-            if (
-                !(e instanceof MessageEvent) &&
-                es.readyState !== EventSource.CLOSED
-            )
-                return;
-            close();
-            const reason =
-                e instanceof MessageEvent && e.data.startsWith('"')
-                    ? (JSON.parse(e.data) as string)
-                    : '';
-            update(replyId, (t) => ({
-                ...t,
-                status: 'error',
-                text:
-                    reason ||
-                    'The run stopped before it finished. Please try again.',
-                seconds: seconds(),
-            }));
-        });
-        return es;
+    const sendPending = (ws: WebSocket) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        for (const [requestId, task] of pending.current) {
+            if (task.sentOn !== ws) {
+                ws.send(
+                    JSON.stringify({
+                        type: 'submit',
+                        request_id: requestId,
+                        conversation_id: chat.current,
+                        prompt: task.prompt,
+                        deep_research: task.deepResearch,
+                        initial_history: chat.current
+                            ? undefined
+                            : task.initialHistory,
+                    }),
+                );
+                task.sentOn = ws;
+            }
+            // The first acknowledgement gives every subsequent task the
+            // same saved conversation, including tasks entered while it is created.
+            if (!chat.current) break;
+        }
     };
 
-    // Reattach to runs still in progress after a reload; close every stream
-    // when the page goes away.
     useEffect(() => {
-        const open = streams.current;
+        let closed = false;
+        let timer: ReturnType<typeof setTimeout>;
+        let heartbeat: ReturnType<typeof setInterval>;
+        let delay = 500;
+        let lastFrame = 0;
         const anchor = window.location.hash.slice(1);
         if (anchor) document.getElementById(anchor)?.scrollIntoView();
-        turns
-            .filter((t) => t.status === 'working' && t.runId)
-            .forEach((t) => follow(t.id, t.runId!));
+        const subscriptions = watches.current;
+        for (const turn of turns) {
+            if (
+                turn.runId &&
+                (turn.status === 'working' || turn.status === 'queued')
+            ) {
+                watches.current.set(turn.runId, {
+                    replyId: turn.id,
+                    after: -1,
+                });
+            }
+        }
+
+        const connect = () => {
+            const url = new URL('/api/chat/socket', window.location.href);
+            url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(url);
+            socket.current = ws;
+            const watch = (runId: string, after: number) =>
+                ws.send(
+                    JSON.stringify({ type: 'watch', run_id: runId, after }),
+                );
+            ws.onopen = () => {
+                if (closed) return;
+                setConnected(true);
+                lastFrame = Date.now();
+                delay = 500;
+                for (const [runId, subscription] of watches.current)
+                    watch(runId, subscription.after);
+                sendPending(ws);
+                heartbeat = setInterval(() => {
+                    if (Date.now() - lastFrame > 45000) ws.close();
+                    else if (ws.readyState === WebSocket.OPEN)
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                }, 15000);
+            };
+            ws.onmessage = (message) => {
+                if (closed) return;
+                lastFrame = Date.now();
+                const frame = JSON.parse(message.data) as ChatFrame;
+                if (frame.type === 'accepted' || frame.type === 'rejected') {
+                    const task = pending.current.get(frame.request_id);
+                    if (!task) return;
+                    pending.current.delete(frame.request_id);
+                    if (frame.type === 'accepted') {
+                        chat.current = frame.conversation_id;
+                        update(task.replyId, (t) => ({
+                            ...t,
+                            runId: frame.run_id,
+                        }));
+                        watches.current.set(frame.run_id, {
+                            replyId: task.replyId,
+                            after: -1,
+                        });
+                        watch(frame.run_id, -1);
+                    } else {
+                        update(task.replyId, (t) => ({
+                            ...t,
+                            status: 'error',
+                            text: frame.error,
+                        }));
+                    }
+                    sendPending(ws);
+                    if (
+                        !conversationID &&
+                        chat.current &&
+                        pending.current.size === 0 &&
+                        !navigating.current
+                    ) {
+                        navigating.current = true;
+                        setChangingChat(true);
+                        router.visit(agentChat(chat.current), {
+                            replace: true,
+                            preserveState: true,
+                            onFinish: () => {
+                                navigating.current = false;
+                                setChangingChat(false);
+                            },
+                        });
+                    }
+                    return;
+                }
+                if (!('run_id' in frame)) return;
+                const subscription = watches.current.get(frame.run_id);
+                if (!subscription) return;
+                if (frame.type === 'event') {
+                    if (frame.seq <= subscription.after) return;
+                    subscription.after = frame.seq;
+                    subscription.started ??= performance.now();
+                    const e = frame.event;
+                    update(subscription.replyId, (t) => ({
+                        ...t,
+                        status: 'working',
+                        events: [...(t.events ?? []), e],
+                        messages: e.assistant_message
+                            ? [...(t.messages ?? []), e.assistant_message]
+                            : t.messages,
+                        text:
+                            e.kind === 'failed'
+                                ? `The run stopped: ${e.err}`
+                                : t.text,
+                    }));
+                } else {
+                    watches.current.delete(frame.run_id);
+                    const seconds =
+                        subscription.started === undefined
+                            ? 0
+                            : Math.round(
+                                  (performance.now() - subscription.started) /
+                                      1000,
+                              );
+                    update(subscription.replyId, (t) => ({
+                        ...t,
+                        status:
+                            frame.type === 'error' ||
+                            t.events?.at(-1)?.kind === 'failed'
+                                ? 'error'
+                                : 'done',
+                        text:
+                            frame.type === 'error'
+                                ? frame.error ||
+                                  'The run stopped before it finished.'
+                                : t.text,
+                        seconds,
+                    }));
+                }
+            };
+            ws.onclose = () => {
+                clearInterval(heartbeat);
+                if (closed) return;
+                setConnected(false);
+                timer = setTimeout(connect, delay);
+                delay = Math.min(delay * 2, 8000);
+            };
+        };
+        connect();
         return () => {
-            submitting.current?.abort();
-            open.forEach((es) => es.close());
-            open.clear();
+            closed = true;
+            clearTimeout(timer);
+            clearInterval(heartbeat);
+            socket.current?.close();
+            socket.current = null;
+            for (const subscription of subscriptions.values())
+                subscription.after = -1;
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    const submit = async (prompt: string) => {
+    const submit = (prompt: string) => {
         const text = prompt.trim();
-        if (!text || loading || submitting.current) return;
-        const request = new AbortController();
-        submitting.current = request;
+        if (!text || navigating.current) return;
         const userId = nextId.current++;
         const replyId = nextId.current++;
+        const initialHistory =
+            legacy && !chat.current
+                ? turns
+                      .filter((turn) => turn.id < legacyLimit)
+                      .flatMap((turn) =>
+                          (turn.from === 'user'
+                              ? [turn.text]
+                              : turn.status === 'done'
+                                ? assistantMessages(turn)
+                                : []
+                          )
+                              .filter((content) => content.trim())
+                              .map((content) => ({ role: turn.from, content })),
+                      )
+                      .slice(-99)
+                : undefined;
+        pending.current.set(crypto.randomUUID(), {
+            replyId,
+            prompt: text,
+            deepResearch,
+            initialHistory,
+        });
         setTurns((t) => [
             ...t,
             { id: userId, from: 'user', text },
-            { id: replyId, from: 'assistant', text: '', status: 'working' },
+            { id: replyId, from: 'assistant', text: '', status: 'queued' },
         ]);
-        try {
-            const result = await startRun(
-                legacy
-                    ? {
-                          deep_research: deepResearch,
-                          messages: [
-                              ...turns
-                                  .flatMap((t) =>
-                                      (t.from === 'user'
-                                          ? [t.text]
-                                          : t.status === 'done'
-                                            ? assistantMessages(t)
-                                            : []
-                                      ).map((content) => ({
-                                          role: t.from,
-                                          content,
-                                      })),
-                                  )
-                                  .slice(-99),
-                              { role: 'user', content: text },
-                          ],
-                      }
-                    : {
-                          deep_research: deepResearch,
-                          conversation_id: conversationID,
-                          request_id: crypto.randomUUID(),
-                          prompt: text,
-                      },
-                request.signal,
-            );
-            if (request.signal.aborted) return;
-            if (result.conversation_id && !conversationID) {
-                router.visit(agentChat(result.conversation_id), {
-                    replace: true,
-                    preserveState: true,
-                });
-                return;
-            }
-            update(replyId, (t) => ({ ...t, runId: result.id }));
-            follow(replyId, result.id);
-        } catch (err) {
-            if (request.signal.aborted) return;
-            update(replyId, (t) => ({
-                ...t,
-                status: 'error',
-                text:
-                    err instanceof Error
-                        ? err.message
-                        : 'The agent could not start. Please try again.',
-            }));
-        } finally {
-            submitting.current = null;
-        }
+        if (socket.current) sendPending(socket.current);
     };
 
     const started = turns.length > 0;
@@ -689,7 +804,9 @@ function Chat({
                                 {waitingForUser
                                     ? 'Waiting for you'
                                     : loading
-                                      ? 'Working…'
+                                      ? connected
+                                          ? 'Working…'
+                                          : 'Reconnecting…'
                                       : 'Ready'}
                             </span>
                         </div>
@@ -720,22 +837,10 @@ function Chat({
                                                     </MessageBubble>
                                                 ) : (
                                                     <MessageContent className="flex flex-col gap-2">
-                                                        <AgentActivity
-                                                            items={activityItems(
-                                                                turn.events ??
-                                                                    [],
-                                                                turn.status ===
-                                                                    'working',
-                                                            )}
-                                                            status={
-                                                                turn.status ===
-                                                                'working'
-                                                                    ? 'working'
-                                                                    : 'complete'
-                                                            }
-                                                            duration={
-                                                                turn.seconds ??
-                                                                0
+                                                        <RunActivity
+                                                            turn={turn}
+                                                            connected={
+                                                                connected
                                                             }
                                                         />
                                                         {latestTodos(
@@ -943,13 +1048,13 @@ function Chat({
                     className="mx-auto mt-2 w-full max-w-3xl"
                 >
                     <PromptInput
-                        loading={loading}
+                        disabled={changingChat}
                         onSubmit={submit}
                         leadingAction={
                             <button
                                 type="button"
                                 aria-pressed={deepResearch}
-                                disabled={loading}
+                                disabled={changingChat}
                                 onClick={toggleDeepResearch}
                                 title="Search multiple sources and review the evidence before answering"
                                 className="inline-flex h-8 items-center gap-1.5 rounded-full border border-transparent px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50 aria-pressed:border-primary/25 aria-pressed:bg-primary/10 aria-pressed:text-primary"
