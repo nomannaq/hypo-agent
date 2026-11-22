@@ -1,5 +1,5 @@
 import { router, usePage } from '@inertiajs/react';
-import { LogOut, Plus, Settings, Sparkles } from 'lucide-react';
+import { CalendarClock, LogOut, Plus, Settings, Sparkles } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { AISidebar } from '@/components/agents/ai-sidebar';
 import type { SidebarResource } from '@/components/agents/ai-sidebar';
@@ -18,12 +18,10 @@ import {
     AnimatedSidebarMenuItem,
     AnimatedSidebarTrigger,
 } from '@/components/motion/animated-sidebar';
-import { agent, logout } from '@/routes';
+import { agent, agentChat, logout, newAgentChat, schedules } from '@/routes';
 import { edit as editProfile } from '@/routes/profile';
 import type { BreadcrumbItem } from '@/types';
 
-// ponytail: conversations aren't persisted yet (roadmap Step 3), so the tree
-// starts with one empty project instead of fake history.
 const RESOURCES: SidebarResource[] = [
     { id: 'hypotheses', label: 'Hypotheses', kind: 'project', children: [] },
 ];
@@ -35,7 +33,10 @@ export default function AgentLayout({
     breadcrumbs?: BreadcrumbItem[];
     children: ReactNode;
 }) {
-    const { auth, name } = usePage().props;
+    const { auth, name, conversations, conversationID } = usePage<{
+        conversations?: { id: string; title: string }[];
+        conversationID?: string;
+    }>().props;
     const { url } = usePage();
     const title = breadcrumbs.at(-1)?.title ?? name;
 
@@ -53,10 +54,9 @@ export default function AgentLayout({
                             <AnimatedSidebarMenuItem>
                                 <AnimatedSidebarMenuButton
                                     icon={<Plus />}
-                                    onSelect={() => {
-                                        sessionStorage.removeItem('hypo.agent.turns');
-                                        router.visit(agent().url);
-                                    }}
+                                    onSelect={() =>
+                                        router.visit(newAgentChat())
+                                    }
                                 >
                                     New chat
                                 </AnimatedSidebarMenuButton>
@@ -70,8 +70,44 @@ export default function AgentLayout({
                                     Agent
                                 </AnimatedSidebarMenuButton>
                             </AnimatedSidebarMenuItem>
+                            <AnimatedSidebarMenuItem>
+                                <AnimatedSidebarMenuButton
+                                    icon={<CalendarClock />}
+                                    isActive={url.startsWith(schedules.url())}
+                                    onSelect={() =>
+                                        router.visit(schedules.url())
+                                    }
+                                >
+                                    Schedules
+                                </AnimatedSidebarMenuButton>
+                            </AnimatedSidebarMenuItem>
                         </AnimatedSidebarMenu>
                     </AnimatedSidebarGroup>
+                    {!!conversations?.length && (
+                        <AnimatedSidebarGroup>
+                            <AnimatedSidebarGroupLabel>
+                                Chats
+                            </AnimatedSidebarGroupLabel>
+                            <AnimatedSidebarMenu>
+                                {conversations.map((chat) => (
+                                    <AnimatedSidebarMenuItem key={chat.id}>
+                                        <AnimatedSidebarMenuButton
+                                            isActive={
+                                                conversationID === chat.id
+                                            }
+                                            onSelect={() =>
+                                                router.visit(agentChat(chat.id))
+                                            }
+                                        >
+                                            <span className="truncate">
+                                                {chat.title}
+                                            </span>
+                                        </AnimatedSidebarMenuButton>
+                                    </AnimatedSidebarMenuItem>
+                                ))}
+                            </AnimatedSidebarMenu>
+                        </AnimatedSidebarGroup>
+                    )}
                     <AnimatedSidebarGroup>
                         <AnimatedSidebarGroupLabel>
                             Projects

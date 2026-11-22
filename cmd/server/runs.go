@@ -21,6 +21,7 @@ import (
 	"nomanqureshi.dev/hpyo-agent/internal/agent"
 	"nomanqureshi.dev/hpyo-agent/internal/executor"
 	"nomanqureshi.dev/hpyo-agent/internal/kernel/temporalkernel"
+	"nomanqureshi.dev/hpyo-agent/internal/runtime"
 )
 
 const maxChatMessages = 100
@@ -29,12 +30,15 @@ const maxChatMessages = 100
 // checks whether its run died without a final event.
 const pingEvery = 15 * time.Second
 
-// startRun starts one agent turn as a durable run on Temporal and returns its
-// ID without waiting. The run lives on the worker; the UI follows it through
-// runEvents and can reattach after a reload.
+// startRun persists a request for the dispatcher. Older clients can still
+// send their own message history instead of selecting a conversation.
 func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Messages []struct {
+		ConversationID string `json:"conversation_id"`
+		RequestID      string `json:"request_id"`
+		Prompt         string `json:"prompt"`
+		DeepResearch   bool   `json:"deep_research"`
+		Messages       []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
 		} `json:"messages"`
@@ -42,45 +46,103 @@ func (s *server) startRun(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &in) {
 		return
 	}
-	n := len(in.Messages)
-	if n == 0 || n > maxChatMessages || in.Messages[n-1].Role != "user" {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
+	req := runtime.Request{
+		ID: "run-" + rand.Text(), Owner: currentUser(r).ID, RequestID: in.RequestID,
+		Input: executor.Input{Workflow: executor.RecurringWorkflowName, Skills: s.skills},
 	}
-	history := make([]agent.Message, 0, n)
-	for _, m := range in.Messages {
-		if (m.Role != "user" && m.Role != "assistant") || strings.TrimSpace(m.Content) == "" {
+	if in.DeepResearch {
+		req.Input.Workflow = executor.DeepResearchWorkflowV2
+	}
+	if in.Messages != nil {
+		n := len(in.Messages)
+		if in.Prompt != "" || in.ConversationID != "" || in.RequestID != "" ||
+			n == 0 || n > maxChatMessages || in.Messages[n-1].Role != "user" {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		history = append(history, agent.Message{Role: agent.Role(m.Role), Text: m.Content})
-	}
-
-	id := "run-" + rand.Text()
-	// The row comes first: the worker's first event references it.
-	if _, err := s.db.Exec(r.Context(), `INSERT INTO agent_runs (id, user_id) VALUES ($1, $2)`, id, currentUser(r).ID); err != nil {
-		s.fail(w, err)
-		return
-	}
-	input, _ := json.Marshal(executor.Input{History: history[:n-1], Prompt: history[n-1].Text})
-	_, err := s.temporal.ExecuteWorkflow(r.Context(), client.StartWorkflowOptions{
-		ID:                       id,
-		TaskQueue:                temporalkernel.TaskQueue,
-		WorkflowExecutionTimeout: 30 * time.Minute, // backstop; the executor's guards end runs long before
-	}, executor.WorkflowName, input)
-	if err != nil {
-		log.Printf("starting run: %v", err)
-		_, _ = s.db.Exec(context.WithoutCancel(r.Context()), `DELETE FROM agent_runs WHERE id = $1`, id)
-		var unavailable *serviceerror.Unavailable
-		if errors.As(err, &unavailable) {
-			http.Error(w, "the agent runtime is unavailable", http.StatusServiceUnavailable)
+		for _, m := range in.Messages {
+			if (m.Role != "user" && m.Role != "assistant") || strings.TrimSpace(m.Content) == "" {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+		}
+		for _, m := range in.Messages[:n-1] {
+			req.Input.History = append(req.Input.History, agent.Message{Role: agent.Role(m.Role), Text: m.Content})
+		}
+		req.Input.Prompt = in.Messages[n-1].Content
+	} else {
+		req.Input.Prompt = strings.TrimSpace(in.Prompt)
+		if req.Input.Prompt == "" || len(req.Input.Prompt) > 32<<10 ||
+			len(in.ConversationID) > 64 || len(in.RequestID) > 64 || strings.TrimSpace(in.RequestID) == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		http.Error(w, "the agent run failed", http.StatusInternalServerError)
-		return
+		req.ConversationID = in.ConversationID
+		if req.ConversationID == "" {
+			req.NewConversationID = "chat-" + rand.Text()
+		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+	receipt, err := s.scheduler.Admit(r.Context(), req)
+	switch {
+	case errors.Is(err, runtime.ErrQueueFull):
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+	case errors.Is(err, runtime.ErrMissingConversation):
+		http.NotFound(w, r)
+	case errors.Is(err, runtime.ErrRequestConflict):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case err != nil:
+		s.fail(w, err)
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		if in.Messages == nil {
+			w.WriteHeader(http.StatusAccepted)
+		}
+		_ = json.NewEncoder(w).Encode(receipt)
+	}
+}
+
+func (s *server) startWorkflow(ctx context.Context, id string, input []byte) error {
+	var version struct {
+		Workflow string `json:"workflow"`
+	}
+	if err := json.Unmarshal(input, &version); err != nil {
+		return err
+	}
+	workflowName := version.Workflow
+	switch workflowName {
+	case "":
+		workflowName = executor.WorkflowName
+	case executor.MemoryWorkflowName, executor.SkillsWorkflowName, executor.SchedulingWorkflowName, executor.ScheduledWorkflowName, executor.RecurringWorkflowName, executor.DeepResearchWorkflowName, executor.DeepResearchWorkflowV2:
+	default:
+		return fmt.Errorf("unknown workflow type %q", workflowName)
+	}
+	timeout := 30 * time.Minute
+	if executor.IsDeepResearchWorkflow(workflowName) {
+		timeout = time.Hour
+	}
+	_, err := s.temporal.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID: id, TaskQueue: temporalkernel.TaskQueue,
+		WorkflowExecutionTimeout:                 timeout,
+		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		WorkflowExecutionErrorWhenAlreadyStarted: true,
+	}, workflowName, input)
+	var started *serviceerror.WorkflowExecutionAlreadyStarted
+	if errors.As(err, &started) {
+		return nil // the same app run was accepted on an earlier attempt
+	}
+	return err
+}
+
+func (s *server) inspectWorkflow(ctx context.Context, id string) (bool, error) {
+	desc, err := s.temporal.DescribeWorkflowExecution(ctx, id, "")
+	var missing *serviceerror.NotFound
+	if errors.As(err, &missing) {
+		return false, runtime.ErrWorkflowMissing
+	}
+	if err != nil {
+		return false, err
+	}
+	return desc.GetWorkflowExecutionInfo().GetStatus() == enums.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
 }
 
 // decideApproval answers the run's pending approval request: the run is
@@ -188,9 +250,20 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 	next := 0
 	checkRun := false
 	for {
-		// Checked before reading, so a run that finished between the two
-		// still has its last events read before being called dead.
-		stopped := checkRun && !s.running(ctx, id)
+		// Read the lifecycle before the events so a concurrent terminal
+		// commit cannot be mistaken for a missing final event.
+		var status *string
+		var failure string
+		if err := s.db.QueryRow(ctx, `SELECT status, COALESCE(failure, '') FROM agent_runs WHERE id = $1`, id).
+			Scan(&status, &failure); err != nil {
+			log.Printf("run %s: reading status: %v", id, err)
+			return
+		}
+		stopped := status != nil && *status == runtime.Failed.String()
+		if status == nil && checkRun {
+			open, err := s.inspectWorkflow(ctx, id)
+			stopped = err == nil && !open
+		}
 		checkRun = false
 
 		rows, err := s.db.Query(ctx, `SELECT seq, event FROM run_events WHERE run_id = $1 AND seq >= $2 ORDER BY seq`, id, next)
@@ -223,7 +296,8 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 			_ = rc.Flush()
 			return
 		case stopped:
-			fmt.Fprint(w, "event: error\ndata: the run stopped without a reply\n\n")
+			data, _ := json.Marshal(failure)
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
 			_ = rc.Flush()
 			return
 		}
@@ -240,16 +314,6 @@ func (s *server) runEvents(w http.ResponseWriter, r *http.Request) {
 			checkRun = true
 		}
 	}
-}
-
-// running reports whether the run's workflow is still going. If Temporal
-// can't be asked, the run is assumed alive and checked again on the next ping.
-func (s *server) running(ctx context.Context, id string) bool {
-	desc, err := s.temporal.DescribeWorkflowExecution(ctx, id, "")
-	if err != nil {
-		return true
-	}
-	return desc.GetWorkflowExecutionInfo().GetStatus() == enums.WORKFLOW_EXECUTION_STATUS_RUNNING
 }
 
 // hub fans Postgres notifications from run_events out to the open streams.

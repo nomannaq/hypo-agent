@@ -60,6 +60,29 @@ func TestCompleteRetriesAndParsesToolCalls(t *testing.T) {
 	}
 }
 
+func TestCompleteSendsOutputLimitOnlyWhenRequested(t *testing.T) {
+	for _, limit := range []int{0, 16384} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				MaxTokens *int `json:"max_tokens"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			if limit == 0 && body.MaxTokens != nil || limit > 0 && (body.MaxTokens == nil || *body.MaxTokens != limit) {
+				t.Errorf("max_tokens = %v for limit %d", body.MaxTokens, limit)
+			}
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+		}))
+		c := NewClient("key", srv.URL, "m")
+		_, err := c.Complete(t.Context(), Request{MaxTokens: limit})
+		srv.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestCompleteDoesNotRetryClientErrors(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

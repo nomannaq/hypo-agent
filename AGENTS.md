@@ -39,19 +39,20 @@ Inertia (gonertia) + React 19 + Tailwind 4 frontend, Nebius Token Factory
 | `cmd/server`: auth, sessions, runs | **Done**: `POST /api/runs` starts a durable run; `GET /api/runs/{id}/events` streams its events (SSE) |
 | `cmd/worker` | **Done**: runs agent workflows and activities, persists run events; survives being killed mid-run |
 | Web UI: beUI chat shell, orb, messages, activity | **Done**: follows runs step by step, reattaches after a reload |
-| `internal/tool` | **Registry, effects, 16 tools**: web (`web_search`, `browse`), a per-run browser session (`browser_open`, `_snapshot`, `_click`, `_type`, `_select`, `_press`, `_scroll`, `_back`, `_wait`, `_screenshot`), and run tools (`todo_write`, `ask_user`, `research` subagents). Sandbox is a stub |
-| Approvals, questions, ledger | **Done**: `waiting` state, approval card and question card in the UI, `POST /api/runs/{id}/approvals`, `tool_ledger` table; tested on memkernel and Temporal. No tool is Write today (browser actions are autonomous by choice) |
+| `internal/tool` | **Registry and effects**: web (`web_search`, `browse`), a per-run browser session (`browser_open`, `_snapshot`, `_click`, `_type`, `_select`, `_press`, `_scroll`, `_back`, `_wait`, `_screenshot`), run tools (`todo_write`, `ask_user`, `research` subagents), and memory tools. Sandbox is a stub |
+| Approvals, questions, ledger | **Done**: `waiting` state, approval card and question card in the UI, `POST /api/runs/{id}/approvals`, `tool_ledger` table; tested on memkernel and Temporal. `remember` and `schedule` are Write. Browser actions are autonomous by choice |
 | Subagents, budgets, artifacts | **Done**: `research` spawns child runs (Temporal child workflows); per-run tool budgets; screenshots in `run_artifacts`, served by `GET /api/runs/{id}/artifacts/{artifact}` |
-| `internal/runtime`, `internal/memory` | Stubs (roadmap Steps 4–5) |
+| `internal/runtime` | Durable run admission, per-user caps, reconciliation, and one-shot and recurring schedules |
+| `internal/memory` | Owner-scoped notes, transcript search, opt-in summaries, and optional pgvector recall |
 | `pgkernel` | Stub (learning path, time-boxed) |
-| Run scheduler, supervisor (rest of Step 4) | Stubs in `internal/runtime` |
-| `skills/`, `sandbox/images/` | Empty (Step 6, and the sandbox runner) |
+| `skills/` | Embedded catalog and `hypothesis-research`, loaded by `read_skill` |
+| `sandbox/images/` | Empty (sandbox runner) |
 
 Roadmap Steps 1 (agent core), 2 (tool registry, web and browser tools,
 approvals, questions, subagents, budgets and the idempotency ledger) and 3
 (streaming runs to the UI), and the durable-execution part of Step 4, are
 complete (see `.junie/plans/durability.md`). Next: the rest
-of Step 4 (scheduler, supervisor) or Step 5 (memory).
+of the [memory, skills, and scheduling plan](.junie/plans/memory-skills-and-scheduling.md).
 
 ## Architecture
 
@@ -70,16 +71,19 @@ web (React/Inertia) ──POST /api/runs──▶ cmd/server ──start workflo
 ```
 
 Each run's events land in `run_events` (written by the worker's
-`events.append` activity) and reach the UI over SSE. Target (from the roadmap):
-runs go through the runtime scheduler; memory and skills plug in as tools.
+`events.append` activity) and reach the UI over SSE. The runtime scheduler
+admits and supervises runs. The memory tools are available to new chat runs.
 
 ### Request flow today
 
-1. `web/src/pages/agent.tsx` POSTs the whole conversation to `/api/runs`.
-2. `cmd/server/runs.go` validates it, records the run in `agent_runs` (owned
-   by the user), starts the `agent` workflow on Temporal (task queue
-   `hypo-agent`, workflow ID = run ID `run-<random>`), and returns
-   `{"id": ...}` without waiting.
+1. `web/src/pages/agent.tsx` posts a prompt, a request ID, and the selected
+   conversation to `POST /api/runs`. The first turn creates the conversation.
+   Legacy clients can send their message history.
+2. `internal/runtime` commits the queued run and returns its ID. The server's
+   dispatcher claims it in Postgres, saves the workflow input assembled from
+   completed turns, and starts its registered workflow on Temporal (task queue
+   `hypo-agent`, workflow ID = application run ID). Admission bounds each user
+   to 10 queued and two active runs, with one active run per conversation.
 3. The page opens `GET /api/runs/{id}/events` (an `EventSource`).
 4. `cmd/worker` runs it: `executor.Run` folds events through `agent.Reduce`,
    calling the model (and tools, once there are any) as activities until the
@@ -97,11 +101,12 @@ the activity's heartbeat stops, Temporal notices within the heartbeat timeout
 (20s) and retries the call on another worker; completed calls are replayed
 from history, not repeated. If the browser disconnects, `EventSource`
 reconnects with `Last-Event-ID` and gets only what it missed; after a reload
-the page restores the conversation from `sessionStorage` and reattaches to
-runs still in progress. If a run ends without a final event (terminated,
-nondeterminism, Postgres down past the append retries), the stream notices on
-its next 15s ping (it asks Temporal) and sends `event: error`. `memkernel` is
-now used only in tests.
+the page restores the conversation from Postgres and reattaches to queued
+and active runs. Old tab-local chats can still be opened from `/agent`.
+The supervisor checks Temporal independently of SSE. A final event and its
+terminal runtime state commit together. When a workflow closes without a
+final event, the supervisor releases its slot and the stream sends
+`event: error`. `memkernel` is used only in tests.
 
 ## Repo map
 
@@ -121,11 +126,13 @@ internal/
   model/           Nebius client: tool calling, retries, usage metering
   dotenv/          .env loader for binaries started without make
   tool/            tool registry, web + browser-session tools, run tools (todo, ask_user, research)
-  runtime/ memory/ stubs for roadmap Steps 4-5
+  runtime/         run admission, lifecycle, and supervisor
+  memory/          owner-scoped memory, transcript search, and background projections
 db/migrations/     goose SQL migrations (users/sessions, pgkernel, agent_runs/run_events, tool_ledger, run_artifacts)
 web/               Vite + React frontend (see "Frontend" below)
 docker/            config for compose services (searxng/settings.yml)
-skills/ sandbox/   future skills and tool sandbox images
+skills/           repository skill files, embedded catalog, and read_skill
+sandbox/          future tool sandbox images
 .junie/plans/      the roadmap
 ```
 
@@ -396,6 +403,92 @@ signals the way the server does. Each was checked against a deliberately
 removed gate, ledger, budget or subagent filter. `TestSmokeBrowserSession`
 (`make smoke`) walks a real form: open, snapshot, type, click submit, back,
 scroll, wait, screenshot.
+
+## Persistent memory
+
+New interactive runs use `agent-recurring-v1` and include the memory tools.
+The worker retains prior workflow registrations for replay.
+Roll out the migration, then the new worker and server. Version information
+travels with the persisted run input, and child runs use the parent's workflow
+name.
+
+- `remember` saves an approved preference or note. The store derives the owner
+  from the run and records a receipt under the activity call key. Deletion
+  clears text and vectors and retains the receipt across activity retries.
+- `recall` searches saved memories and returns provenance. The first model call
+  also gets a bounded recall result through a journaled activity. Only the
+  top-level run gets private memories and conversation search.
+- `session_search` searches the owner's prior prompts and final assistant
+  replies and returns excerpts with links. Search excludes raw tool events.
+- **Settings → Memory** shows saved entries and lets the user delete them or
+  enable summaries for future completed turns. The worker creates summaries
+  asynchronously using the configured chat model.
+- Text search works with Postgres alone. To enable semantic memory, configure
+  `MEMORY_EMBEDDING_BASE_URL`, `MEMORY_EMBEDDING_MODEL`, and an optional
+  `MEMORY_EMBEDDING_API_KEY` on workers. Use the same 1024-dimensional model
+  configuration on every worker. The provider receives saved memory text for
+  indexing and sends back vectors for recall queries. Search falls back to text
+  if the provider fails.
+
+## Repository skills
+
+Add `skills/<name>/SKILL.md` with YAML `name` and `description` frontmatter.
+The name must match the directory. The catalog accepts up to eight files, each
+at most 8 KiB. Build the server to include changes to bundled files.
+
+The server embeds the catalog and persists its sorted metadata, bodies, and
+SHA-256 digest in each admitted run's input. Research children inherit that
+snapshot. The model sees the name and description and can load the full body
+through `read_skill {name}`. The activity resolves the name in the persisted
+snapshot, so adding or editing a skill changes the catalog for new runs.
+Workers serve the snapshot carried in each skills-enabled run. Skills use
+the tools already offered to that run.
+
+## Schedules
+
+The `schedule` Write tool uses the approval flow to show the exact task,
+first local RFC3339 timestamp with UTC offset, IANA timezone, and cadence. The offset must
+match the timezone at that instant. Schedules target the saved conversation
+where the user requested them. The Schedules page lists owned schedules,
+cancels pending ones, and links fired schedules to their run.
+
+The server uses the Postgres clock, and creation deduplicates on the tool call
+key. One-shot schedules transition to `fired`, `cancelled`, or `missed`.
+A daily or weekly series stays `pending` until cancelled. The queued run,
+recorded outcome, and next due time commit together under the schedule lock.
+A unique key on `(schedule_id, scheduled_for)` prevents duplicate occurrences.
+
+Daily and weekly schedules preserve the original local clock time, and weekly
+schedules preserve the weekday. Future DST gaps skip the date. Future overlaps
+use the earlier instant. If a prior occurrence is queued or active, the due
+occurrence is skipped. A full queue is retried for up to one hour after the
+due time. After longer downtime, the series records the expired due occurrence
+and advances to the first eligible date. Cancelling a series stops future
+occurrences. Runs already admitted follow the normal run lifecycle.
+
+Scheduled runs use `agent-scheduled-v1` with the approved prompt and pinned
+skill catalog. The profile offers web search, stateless browsing, skills,
+and research subagents. The task result streams to the original chat.
+
+## Deep research mode
+
+The prompt composer sends `deep_research: true` to `POST /api/runs`. Admission
+pins `agent-deep-research-v2` in the saved input. The worker retains v1 for replay. The workflow checkpoints
+planning, parallel collection, targeted follow-up, drafting, independent
+review, and the revised report. Progress reaches the existing SSE stream
+through named research-stage events represented as tool calls and results.
+
+Investigation and citation-review workers use read-only browser tools and
+return evidence with direct URLs. The parent reads source provenance from
+successful browser tool results. Child runs receive their assigned task and
+the pinned catalog. The final stage weighs reviewer findings with the source
+notes, including gaps and unavailable investigations. On a blank model response,
+the workflow journals one shorter retry for that stage. If drafting still
+returns no text, reviewers work from the source notes. If final writing still
+returns no text, the chat receives the findings and review notes.
+
+The staged approach is adapted from the
+[HyperResearch workflow](https://github.com/jordan-gibbs/hyperresearch/blob/8f192b88bf777e2ad6da5e07e4b2ad7af40e2d7c/src/hyperresearch/skills/hyperresearch.md).
 
 ## Model gateway
 
