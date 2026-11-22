@@ -1,4 +1,5 @@
-import { Head } from '@inertiajs/react';
+import { Head, router } from '@inertiajs/react';
+import { Telescope } from 'lucide-react';
 import { motion, useAnimationFrame, useMotionValue } from 'motion/react';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -25,7 +26,7 @@ import { MessageScroller } from '@/components/agents/message-scroller';
 import { PromptInput } from '@/components/agents/prompt-input';
 import { VoiceOrb } from '@/components/agents/voice-orb';
 import { SPRING_LAYOUT } from '@/lib/ease';
-import { agent } from '@/routes';
+import { agent, agentChat } from '@/routes';
 
 type ToolCall = { id: string; name: string; args?: unknown };
 
@@ -52,6 +53,21 @@ const toolLabel = (call: ToolCall, done: boolean) => {
     };
     const el = `element ${a.element_index ?? '?'}`;
     const labels: Record<string, [string, string]> = {
+        deep_research_plan: ['Planning the research', 'Planned the research'],
+        deep_research_collect: [
+            'Searching for sources in parallel',
+            'Collected initial evidence',
+        ],
+        deep_research_investigate: [
+            'Investigating findings and gaps',
+            'Investigated findings and gaps',
+        ],
+        deep_research_draft: ['Drafting the report', 'Drafted the report'],
+        deep_research_review: [
+            'Reviewing citations and conclusions',
+            'Reviewed citations and conclusions',
+        ],
+        deep_research_report: ['Finalizing the report', 'Finalized the report'],
         web_search: [`Searching “${a.query}”`, `Searched “${a.query}”`],
         browse: [`Reading ${host(a.url ?? '')}`, `Read ${host(a.url ?? '')}`],
         browser_open: [
@@ -69,6 +85,11 @@ const toolLabel = (call: ToolCall, done: boolean) => {
         browser_screenshot: ['Taking a screenshot', 'Took a screenshot'],
         todo_write: ['Updating the plan', 'Updated the plan'],
         ask_user: ['Asking you', 'Asked you'],
+        read_skill: ['Loading a skill', 'Loaded a skill'],
+        schedule: ['Scheduling a task', 'Scheduled a task'],
+        remember: ['Saving a memory', 'Saved a memory'],
+        recall: ['Searching saved memories', 'Searched saved memories'],
+        session_search: ['Searching past chats', 'Searched past chats'],
         research: [
             `Researching ${a.tasks?.length ?? ''} topics in parallel`,
             `Researched ${(a.tasks ?? []).map((t) => t.title).join(', ')}`,
@@ -108,10 +129,7 @@ type Turn = {
     seconds?: number; // how long the run took
 };
 
-// The conversation lives in sessionStorage so a reload restores it and
-// reattaches to a run still in progress.
-// ponytail: per-tab and client-side only; a conversations table replaces it
-// once chats are listed in the sidebar.
+// Preserve the original tab-local chat while older sessions are still open.
 const STORAGE_KEY = 'hypo.agent.turns';
 const loadTurns = (): Turn[] => {
     try {
@@ -133,16 +151,67 @@ const loadTurns = (): Turn[] => {
     }
 };
 
+type StoredRun = {
+    id: string;
+    prompt: string;
+    reply: string;
+    status: 'queued' | 'starting' | 'running' | 'succeeded' | 'failed';
+    scheduled?: boolean;
+};
+
+type AgentProps = {
+    conversationID: string;
+    runs: StoredRun[];
+    newChat: boolean;
+};
+
+const restoreRuns = (runs: StoredRun[]): Turn[] =>
+    runs.flatMap((run, i): Turn[] => [
+        {
+            id: i * 2,
+            from: 'user',
+            text: run.scheduled ? `Scheduled task: ${run.prompt}` : run.prompt,
+        },
+        {
+            id: i * 2 + 1,
+            from: 'assistant',
+            text: run.reply,
+            runId: run.id,
+            status:
+                run.status === 'succeeded'
+                    ? 'done'
+                    : run.status === 'failed'
+                      ? 'error'
+                      : 'working',
+        },
+    ]);
+
 const startRun = async (
-    messages: { role: 'user' | 'assistant'; content: string }[],
+    request: { deep_research: boolean } & (
+        | { messages: { role: 'user' | 'assistant'; content: string }[] }
+        | { prompt: string; request_id: string; conversation_id: string }
+    ),
+    signal: AbortSignal,
 ) => {
-    const res = await fetch('/api/runs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages }),
+    const send = () =>
+        fetch('/api/runs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request),
+            signal,
+        });
+    const res = await send().catch((err: unknown) => {
+        if ('request_id' in request && !signal.aborted) return send();
+        throw err;
     });
-    if (!res.ok) throw new Error('request failed');
-    return ((await res.json()) as { id: string }).id;
+    if (!res.ok) {
+        throw new Error(
+            res.status === 429
+                ? 'Your run queue is full. Try again when a run finishes.'
+                : 'The agent could not start. Please try again.',
+        );
+    }
+    return (await res.json()) as { id: string; conversation_id?: string };
 };
 
 // The run's requests to the user (approval_requested): Write calls to
@@ -219,7 +288,39 @@ const approvalParameters = (call: ToolCall) => {
         url?: unknown;
         form?: unknown;
         fields?: Record<string, unknown>;
+        kind?: unknown;
+        content?: unknown;
+        when?: unknown;
+        timezone?: unknown;
+        task?: unknown;
+        repeat?: unknown;
     };
+    if (call.name === 'schedule') {
+        return [
+            { id: 'task', label: 'Task', value: String(args.task ?? '') },
+            {
+                id: 'repeat',
+                label: 'Repeats',
+                value: String(args.repeat ?? 'once'),
+            },
+            { id: 'when', label: 'First run', value: String(args.when ?? '') },
+            {
+                id: 'timezone',
+                label: 'Timezone',
+                value: String(args.timezone ?? ''),
+            },
+        ];
+    }
+    if (call.name === 'remember') {
+        return [
+            { id: 'kind', label: 'Type', value: String(args.kind ?? '') },
+            {
+                id: 'content',
+                label: 'Memory',
+                value: String(args.content ?? ''),
+            },
+        ];
+    }
     const params = [];
     if (typeof args.url === 'string')
         params.push({ id: 'url', label: 'Page', value: args.url });
@@ -241,12 +342,18 @@ const activityItems = (
         if (e.kind === 'tool_result' && e.call_id) done.set(e.call_id, e);
     events.forEach((e, i) => {
         if (e.kind !== 'model_reply') return;
-        items.push({
-            id: `model-${i}`,
-            type: 'step',
-            label: 'Asked the model',
-            status: 'complete',
-        });
+        if (
+            !e.tool_calls?.some((call) =>
+                call.name.startsWith('deep_research_'),
+            )
+        ) {
+            items.push({
+                id: `model-${i}`,
+                type: 'step',
+                label: 'Asked the model',
+                status: 'complete',
+            });
+        }
         for (const call of e.tool_calls ?? []) {
             const result = done.get(call.id);
             const asked = events.some(
@@ -283,15 +390,42 @@ const activityItems = (
     return items;
 };
 
-export default function Agent() {
-    const [turns, setTurns] = useState<Turn[]>(loadTurns);
+export default function Agent(props: AgentProps) {
+    const [deepResearch, setDeepResearch] = useState(false);
+    return (
+        <Chat
+            key={props.conversationID || (props.newChat ? 'new' : 'legacy')}
+            {...props}
+            deepResearch={deepResearch}
+            toggleDeepResearch={() => setDeepResearch((active) => !active)}
+        />
+    );
+}
+
+function Chat({
+    conversationID,
+    runs,
+    newChat,
+    deepResearch,
+    toggleDeepResearch,
+}: AgentProps & {
+    deepResearch: boolean;
+    toggleDeepResearch: () => void;
+}) {
+    const [legacy] = useState(
+        () => !conversationID && !newChat && loadTurns().length > 0,
+    );
+    const [turns, setTurns] = useState<Turn[]>(() =>
+        legacy ? loadTurns() : restoreRuns(runs),
+    );
     const nextId = useRef(Math.max(0, ...turns.map((t) => t.id + 1)));
     const loading = turns.some((t) => t.status === 'working');
     const streams = useRef(new Set<EventSource>());
+    const submitting = useRef<AbortController | null>(null);
 
     useEffect(() => {
-        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(turns));
-    }, [turns]);
+        if (legacy) sessionStorage.setItem(STORAGE_KEY, JSON.stringify(turns));
+    }, [legacy, turns]);
 
     // The orb breathes quietly at rest and pulses while the agent works.
     const activity = useMotionValue(0.06);
@@ -343,10 +477,15 @@ export default function Agent() {
     const follow = (replyId: number, runId: string) => {
         const started = performance.now();
         const seconds = () => Math.round((performance.now() - started) / 1000);
+        const open = streams.current;
         const es = new EventSource(
             `/api/runs/${encodeURIComponent(runId)}/events`,
         );
-        streams.current.add(es);
+        open.add(es);
+        const close = () => {
+            es.close();
+            open.delete(es);
+        };
         update(replyId, (t) => ({ ...t, events: [] }));
         es.onmessage = (m) => {
             const e = JSON.parse(m.data) as AgentEvent;
@@ -362,10 +501,10 @@ export default function Agent() {
             }));
         };
         es.addEventListener('end', () => {
-            es.close();
+            close();
             update(replyId, (t) => ({
                 ...t,
-                status: 'done',
+                status: t.events?.at(-1)?.kind === 'failed' ? 'error' : 'done',
                 seconds: seconds(),
             }));
         });
@@ -377,11 +516,17 @@ export default function Agent() {
                 es.readyState !== EventSource.CLOSED
             )
                 return;
-            es.close();
+            close();
+            const reason =
+                e instanceof MessageEvent && e.data.startsWith('"')
+                    ? (JSON.parse(e.data) as string)
+                    : '';
             update(replyId, (t) => ({
                 ...t,
                 status: 'error',
-                text: 'Sorry, the run stopped before it finished. Please try again.',
+                text:
+                    reason ||
+                    'The run stopped before it finished. Please try again.',
                 seconds: seconds(),
             }));
         });
@@ -392,10 +537,13 @@ export default function Agent() {
     // when the page goes away.
     useEffect(() => {
         const open = streams.current;
+        const anchor = window.location.hash.slice(1);
+        if (anchor) document.getElementById(anchor)?.scrollIntoView();
         turns
             .filter((t) => t.status === 'working' && t.runId)
             .forEach((t) => follow(t.id, t.runId!));
         return () => {
+            submitting.current?.abort();
             open.forEach((es) => es.close());
             open.clear();
         };
@@ -404,31 +552,66 @@ export default function Agent() {
 
     const submit = async (prompt: string) => {
         const text = prompt.trim();
-        if (!text || loading) return;
+        if (!text || loading || submitting.current) return;
+        const request = new AbortController();
+        submitting.current = request;
         const userId = nextId.current++;
         const replyId = nextId.current++;
-        const history = [
-            ...turns
-                .filter((t) => t.from === 'user' || t.status === 'done')
-                .filter((t) => t.text)
-                .map((t) => ({ role: t.from, content: t.text })),
-            { role: 'user' as const, content: text },
-        ];
         setTurns((t) => [
             ...t,
             { id: userId, from: 'user', text },
             { id: replyId, from: 'assistant', text: '', status: 'working' },
         ]);
         try {
-            const runId = await startRun(history);
-            update(replyId, (t) => ({ ...t, runId }));
-            follow(replyId, runId);
-        } catch {
+            const result = await startRun(
+                legacy
+                    ? {
+                          deep_research: deepResearch,
+                          messages: [
+                              ...turns
+                                  .filter(
+                                      (t) =>
+                                          (t.from === 'user' ||
+                                              t.status === 'done') &&
+                                          t.text,
+                                  )
+                                  .map((t) => ({
+                                      role: t.from,
+                                      content: t.text,
+                                  })),
+                              { role: 'user', content: text },
+                          ],
+                      }
+                    : {
+                          deep_research: deepResearch,
+                          conversation_id: conversationID,
+                          request_id: crypto.randomUUID(),
+                          prompt: text,
+                      },
+                request.signal,
+            );
+            if (request.signal.aborted) return;
+            if (result.conversation_id && !conversationID) {
+                router.visit(agentChat(result.conversation_id), {
+                    replace: true,
+                    preserveState: true,
+                });
+                return;
+            }
+            update(replyId, (t) => ({ ...t, runId: result.id }));
+            follow(replyId, result.id);
+        } catch (err) {
+            if (request.signal.aborted) return;
             update(replyId, (t) => ({
                 ...t,
                 status: 'error',
-                text: 'Sorry, something went wrong starting the agent. Please try again.',
+                text:
+                    err instanceof Error
+                        ? err.message
+                        : 'The agent could not start. Please try again.',
             }));
+        } finally {
+            submitting.current = null;
         }
     };
 
@@ -470,6 +653,7 @@ export default function Agent() {
                                 {turns.map((turn) => (
                                     <Message
                                         key={turn.id}
+                                        id={turn.runId}
                                         from={turn.from}
                                         animateIn
                                     >
@@ -570,7 +754,15 @@ export default function Agent() {
                                                         <ToolApproval
                                                             key={key}
                                                             tool={call.name}
-                                                            description="The agent wants to do this on your behalf. Nothing is sent until you allow it."
+                                                            description={
+                                                                call.name ===
+                                                                'remember'
+                                                                    ? 'Save this information for future chats.'
+                                                                    : call.name ===
+                                                                        'schedule'
+                                                                      ? 'Run this task on the approved schedule and deliver results in this chat.'
+                                                                      : 'Allow the agent to perform this action.'
+                                                            }
                                                             parameters={approvalParameters(
                                                                 call,
                                                             )}
@@ -655,7 +847,27 @@ export default function Agent() {
                     <PromptInput
                         loading={loading}
                         onSubmit={submit}
-                        placeholder="Describe a hypothesis to research…"
+                        leadingAction={
+                            <button
+                                type="button"
+                                aria-pressed={deepResearch}
+                                disabled={loading}
+                                onClick={toggleDeepResearch}
+                                title="Search multiple sources and review the evidence before answering"
+                                className="inline-flex h-8 items-center gap-1.5 rounded-full border border-transparent px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50 aria-pressed:border-primary/25 aria-pressed:bg-primary/10 aria-pressed:text-primary"
+                            >
+                                <Telescope
+                                    aria-hidden="true"
+                                    className="size-3.5"
+                                />
+                                Deep research
+                            </button>
+                        }
+                        placeholder={
+                            deepResearch
+                                ? 'What should we research in depth?'
+                                : 'Describe a hypothesis to research…'
+                        }
                     />
                 </GlowFrame>
             </div>
