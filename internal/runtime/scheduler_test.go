@@ -48,7 +48,7 @@ func runtimeTestDB(t *testing.T, migrations ...string) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	base := []string{"20261119191023_create_users.sql", "20261120223657_create_run_events.sql", "20261122004308_durable_conversations.sql"}
-	base = append(base, "20261122014500_assistant_messages.sql", "20261122015500_research_lane.sql")
+	base = append(base, "20261122014500_assistant_messages.sql", "20261122015500_research_lane.sql", "20261122015600_conversation_run_lanes.sql", "20261122015700_run_cancellation.sql")
 	for _, name := range append(base, migrations...) {
 		sql, err := db.Migrations.ReadFile("migrations/" + name)
 		if err != nil {
@@ -103,7 +103,6 @@ func TestSchedulerPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := Request{ID: "second", Owner: 1, ConversationID: "chat", RequestID: "client-second", Input: executor.Input{Prompt: "follow up", Workflow: executor.SkillsWorkflowName, Skills: catalog}}
-	admit(second)
 	forged := second
 	forged.Owner = 2
 	if _, err := s.Admit(ctx, forged); !errors.Is(err, ErrMissingConversation) {
@@ -112,10 +111,9 @@ func TestSchedulerPostgres(t *testing.T) {
 	admit(Request{ID: "third", Owner: 1, NewConversationID: "other", Input: executor.Input{Prompt: "other"}})
 	admit(Request{ID: "fourth", Owner: 1, NewConversationID: "last", Input: executor.Input{Prompt: "last"}})
 
-	// One dispatcher claims the first turn, another claims a different
-	// conversation. The next turn and the account's third slot stay queued.
-	claims := make(chan string, 2)
-	for range 2 {
+	// Concurrent dispatchers claim distinct runs.
+	claims := make(chan string, 3)
+	for range 3 {
 		wg.Go(func() {
 			id, _, err := s.claim(ctx)
 			if err != nil {
@@ -130,11 +128,8 @@ func TestSchedulerPostgres(t *testing.T) {
 	for id := range claims {
 		got[id] = true
 	}
-	if !got["first"] || !got["third"] {
+	if !got["first"] || !got["third"] || !got["fourth"] {
 		t.Fatalf("claims = %v", got)
-	}
-	if _, _, err := s.claim(ctx); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("claim beyond account cap: %v", err)
 	}
 
 	// A terminal append can win against the start acknowledgement. Its
@@ -165,6 +160,7 @@ func TestSchedulerPostgres(t *testing.T) {
 	if err := s.advance(ctx, "first", Starting, WorkflowStarted, ""); err != nil {
 		t.Fatal(err)
 	}
+	admit(second)
 	id, input, err := s.claim(ctx)
 	if err != nil || id != "second" {
 		t.Fatalf("follow-up claim = %q, %v", id, err)
@@ -181,15 +177,15 @@ func TestSchedulerPostgres(t *testing.T) {
 	exec("UPDATE agent_runs SET next_check = now() WHERE id = 'second'")
 	s.Inspect = func(_ context.Context, id string) (bool, error) {
 		if id != "second" {
-			t.Fatalf("unexpected workflow check %q", id)
+			t.Errorf("unexpected workflow check %q", id)
 		}
 		return true, nil
 	}
 	s.Start = func(context.Context, string, []byte) error {
-		t.Fatal("dispatcher reran an accepted workflow")
+		t.Error("dispatcher reran an accepted workflow")
 		return nil
 	}
-	if err := s.checkOne(ctx); err != nil {
+	if err := s.checkDue(ctx); err != nil {
 		t.Fatal(err)
 	}
 	assertState := func(id string, want Status) {
@@ -203,11 +199,172 @@ func TestSchedulerPostgres(t *testing.T) {
 	assertState("second", Running)
 	exec("UPDATE agent_runs SET next_check = now() WHERE id = 'second'")
 	s.Inspect = func(context.Context, string) (bool, error) { return false, nil }
-	if err := s.checkOne(ctx); err != nil {
+	if err := s.checkDue(ctx); err != nil {
 		t.Fatal(err)
 	}
 	assertState("second", Failed)
-	if id, _, err := s.claim(ctx); err != nil || id != "fourth" {
-		t.Fatalf("slot released after workflow closed: %s, %v", id, err)
+}
+
+func TestTurnsInAChatRunConcurrently(t *testing.T) {
+	ctx := t.Context()
+	pool := runtimeTestDB(t, "20261122015800_concurrent_chat_turns.sql")
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id,name,email,password_hash) VALUES (1,'One','orchestrator@test','-')"); err != nil {
+		t.Fatal(err)
+	}
+	s := Scheduler{DB: pool}
+	admit := func(id, prompt, workflow, conversation, newConversation string) {
+		t.Helper()
+		_, err := s.Admit(ctx, Request{
+			ID: id, Owner: 1, ConversationID: conversation, NewConversationID: newConversation,
+			Input: executor.Input{Prompt: prompt, Workflow: workflow},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	claim := func(want string) executor.Input {
+		t.Helper()
+		id, raw, err := s.claim(ctx)
+		var input executor.Input
+		if err != nil || id != want || json.Unmarshal(raw, &input) != nil {
+			t.Fatalf("claim = %q, %v; want %q", id, err, want)
+		}
+		return input
+	}
+	noClaim := func(why string) {
+		t.Helper()
+		if _, _, err := s.claim(ctx); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("%s: %v", why, err)
+		}
+	}
+
+	// The orchestrator answers a follow-up while the first turn is still busy,
+	// and the follow-up knows that turn is pending.
+	admit("first", "Collect evidence", executor.ResponsiveWorkflowName, "", "chat")
+	admit("follow-up", "Explain the terms", executor.ResponsiveWorkflowName, "chat", "")
+	claim("first")
+	for seq, e := range []agent.Event{
+		{Kind: agent.UserMessage, Text: "Collect evidence"},
+		{Kind: agent.ModelReply, Text: "Looking into it.", ToolCalls: []agent.ToolCall{
+			{ID: "s", Name: "web_search", Args: json.RawMessage(`{"query":"q"}`)},
+			{ID: "b", Name: "browse", Args: json.RawMessage(`{"url":"https://example.test/a"}`)},
+		}},
+	} {
+		if err := s.AppendEvent(ctx, "first", seq, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	input := claim("follow-up")
+	if len(input.ActiveResearch) != 1 || input.ActiveResearch[0] != "Collect evidence" {
+		t.Fatalf("follow-up input = %+v", input)
+	}
+	// The orchestrator supervises the first turn from real progress.
+	for _, want := range []string{`"Collect evidence": starting`, "Web searches: 1.", "https://example.test/a", `Last message to the user: "Looking into it."`} {
+		if !strings.Contains(input.Progress, want) {
+			t.Fatalf("progress lacks %q:\n%s", want, input.Progress)
+		}
+	}
+	for range 2 {
+		if yielded, err := s.YieldResearch(ctx, "first"); err != nil || !yielded {
+			t.Fatalf("research yield = %v, %v", yielded, err)
+		}
+	}
+	// A second investigation in the same chat also goes to the background.
+	if yielded, err := s.YieldResearch(ctx, "follow-up"); err != nil || !yielded {
+		t.Fatalf("same-chat yield = %v, %v", yielded, err)
+	}
+	admit("deep", "Deep review", executor.DeepResearchWorkflowV3, "chat", "")
+	claim("deep") // third background slot, same chat
+	admit("deep-2", "Wait for research capacity", executor.DeepResearchWorkflowV3, "chat", "")
+	noClaim("background cap applies")
+
+	// Foreground capacity is separate from background research.
+	for _, id := range []string{"a", "b", "c", "d"} {
+		admit(id, "question "+id, executor.ResponsiveWorkflowName, "chat", "")
+	}
+	for _, id := range []string{"a", "b", "c", "d"} {
+		claim(id)
+	}
+	admit("e", "question e", executor.ResponsiveWorkflowName, "chat", "")
+	noClaim("foreground cap applies")
+
+	admit("status", "/status", executor.ResponsiveWorkflowName, "chat", "")
+	var reply string
+	if err := pool.QueryRow(ctx, "SELECT body FROM run_assistant_messages('status')").Scan(&reply); err != nil ||
+		!strings.Contains(reply, "Chat turns: 4 active, 1 queued") ||
+		!strings.Contains(reply, "Background research: 3 active, 1 queued") {
+		t.Fatalf("status must be published with all slots occupied: %q, %v", reply, err)
+	}
+	if err := s.AppendEvent(ctx, "first", 0, agent.Event{Kind: agent.ModelReply, Text: "Research complete."}); err != nil {
+		t.Fatal(err)
+	}
+	claim("deep-2")
+	if err := s.AppendEvent(ctx, "a", 0, agent.Event{Kind: agent.ModelReply, Text: "Done."}); err != nil {
+		t.Fatal(err)
+	}
+	claim("e")
+}
+
+func TestCancellationPersistsAndReleasesSlots(t *testing.T) {
+	ctx := t.Context()
+	pool := runtimeTestDB(t)
+	if _, err := pool.Exec(ctx, "INSERT INTO users (id,name,email,password_hash) VALUES (1,'One','cancel@test','-'), (2,'Two','other@test','-')"); err != nil {
+		t.Fatal(err)
+	}
+	s := Scheduler{DB: pool}
+	for _, id := range []string{"running", "other-running", "filler", "queued", "next"} {
+		if _, err := s.Admit(ctx, Request{ID: id, Owner: 1, Input: executor.Input{Prompt: id, Workflow: executor.DeepResearchWorkflowV3}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if id, _, err := s.claim(ctx); err != nil || id != "running" {
+		t.Fatalf("claim = %s, %v", id, err)
+	}
+	for _, want := range []string{"other-running", "filler"} {
+		if id, _, err := s.claim(ctx); err != nil || id != want {
+			t.Fatalf("claim = %s, %v; want %s", id, err, want)
+		}
+	}
+	for _, id := range []string{"queued", "running"} {
+		if found, err := s.RequestCancellation(ctx, id, 2); err != nil || found {
+			t.Fatalf("foreign stop = %t, %v", found, err)
+		}
+		for range 2 {
+			if found, err := s.RequestCancellation(ctx, id, 1); err != nil || !found {
+				t.Fatalf("owner stop = %t, %v", found, err)
+			}
+		}
+	}
+	if _, _, err := s.claim(ctx); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cancelling run should retain its slot: %v", err)
+	}
+	restarted := Scheduler{
+		DB:      pool,
+		Inspect: func(context.Context, string) (bool, error) { return true, nil },
+		CancelWorkflow: func(_ context.Context, id string) error {
+			if id != "running" {
+				t.Errorf("cancelled unexpected workflow %s", id)
+			}
+			return nil
+		},
+	}
+	if err := restarted.checkDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE agent_runs SET next_check = now() WHERE id = 'running'"); err != nil {
+		t.Fatal(err)
+	}
+	restarted.Inspect = func(context.Context, string) (bool, error) { return false, nil }
+	if err := restarted.checkDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"running", "queued"} {
+		var status, failure string
+		if err := pool.QueryRow(ctx, "SELECT status, failure FROM agent_runs WHERE id = $1", id).Scan(&status, &failure); err != nil || status != Failed.String() || failure != cancellationReason {
+			t.Fatalf("state %s = %s (%s), %v", id, status, failure, err)
+		}
+	}
+	if id, _, err := restarted.claim(ctx); err != nil || id != "next" {
+		t.Fatalf("claim after cancellation = %s, %v", id, err)
 	}
 }

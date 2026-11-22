@@ -150,7 +150,7 @@ func TestScheduleDispatchPostgres(t *testing.T) {
 		t.Fatalf("claim scheduled run: %q, %v", id, err)
 	} else {
 		var payload executor.Input
-		if err := json.Unmarshal(input, &payload); err != nil || payload.Workflow != executor.ScheduledWorkflowName ||
+		if err := json.Unmarshal(input, &payload); err != nil || payload.Workflow != executor.ScheduledWorkflowV2 ||
 			payload.Skills == nil || payload.Skills.Digest != catalog.Digest || payload.Prompt != first.Prompt || len(payload.History) != 0 {
 			t.Fatalf("unattended payload: %+v, %v", payload, err)
 		}
