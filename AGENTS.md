@@ -115,6 +115,7 @@ cmd/
   server/          HTTP + Inertia app: auth, sessions, settings, runs + SSE, `seed` subcommand
   migrate/         goose CLI (migrations embedded from db/)
   worker/          Temporal worker: the agent workflow + its activities
+  browser-sessions/ Local service that keeps live tabs across worker restarts
 internal/
   agent/           pure State × Event -> State; no I/O imports
   kernel/          the durability contract (Ctx, Activity, Call, sentinel errors)
@@ -335,16 +336,16 @@ compose network. Tool output is untrusted (a page can contain instructions);
 the system prompt tells the model to treat it as data. Outputs over
 `MaxToolOutput` (16 KB) are truncated by the executor.
 
-**Browser sessions** (`internal/tool/session.go`): one page per run, in the
-worker's memory, keyed by the run ID the executor passes in the call's
-context (`tool.WithCall`; the model never names a run). A session is locked
-per call and bound to that call's deadline, and closed after 10 minutes
-unused. It does not survive a worker restart, and with more than one worker a
-run's next call can land where its page isn't: the tool says so and the model
-reopens the page (a `ponytail:` in session.go names the fix, pinning browser
-activities to one worker). Never close sessions from workflow code: a
-deferred call in `executor.Run` also runs when Temporal evicts a cached
-workflow, mid-run.
+**Browser sessions** (`internal/tool/session.go`): the `browser-sessions`
+service holds one live page per run and keeps the original CDP connection
+open when an agent worker restarts. All workers for the same environment
+use the same service endpoint. Run IDs and call keys come from the executor.
+The service serializes calls per run and keeps receipts so an activity
+retry can retrieve the result of an accepted action after losing its worker.
+Idle tabs and receipts expire after about 10 minutes. Restarting the
+session service or Obscura closes the affected tabs. The agent can then
+open the page again. Browser commands run within the tool activity and
+session service, outside workflow replay.
 
 Each tool has an `Effect` (`tool.Read` or `tool.Write`, an explicit enum in
 `internal/tool/effects.go`). Browser actions are Read by choice: the agent acts
@@ -538,7 +539,7 @@ errors, 429s and 5xx with exponential backoff and full jitter (honouring
 ## Commands
 
 ```bash
-make up                 # Postgres (pgvector), Temporal + UI, Obscura, SearXNG
+make up                 # Postgres, Temporal + UI, Obscura, browser sessions, SearXNG
 make down
 make migrate            # run pending migrations
 make migration name=x   # new migration file in db/migrations
@@ -563,8 +564,11 @@ cd web && npm run typecheck && npm run lint
 `NEBIUS_TOKEN_FACTORY` (required by the worker, which makes the model calls),
 `OBSCURA_CDP_TOKEN` (required by `make up` and the worker; `openssl rand -hex
 32`), optional `NEBIUS_MODEL`, `NEBIUS_BASE_URL`, `TEMPORAL_ADDRESS` (default
-`localhost:7233`), `OBSCURA_URL` (default `http://localhost:9222`) and
-`SEARXNG_URL` (default `http://localhost:8888`). The server and worker also load `.env` themselves when
+`localhost:7233`), `OBSCURA_URL` (default `http://localhost:9222`),
+`BROWSER_SESSION_URL` (default `http://127.0.0.1:9233`), and
+`SEARXNG_URL` (default `http://localhost:8888`). Start the session service
+before rolling out workers that use it. Tabs opened by the old in-process
+worker need to be reopened during this transition. The server and worker also load `.env` themselves when
 started without `make` (`internal/dotenv`); `go test` does not.
 
 | Port | What |
@@ -575,6 +579,7 @@ started without `make` (`internal/dotenv`); `go test` does not.
 | 7233 | Temporal frontend (gRPC) |
 | 8088 | Temporal UI (not 8080, which is the Go server) |
 | 127.0.0.1:9222 | Obscura CDP (browse tool; needs the bearer token) |
+| 127.0.0.1:9233 | Browser session service (uses the Obscura bearer token) |
 | 127.0.0.1:8888 | SearXNG (web_search tool) |
 
 ## Frontend
